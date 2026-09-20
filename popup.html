@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>YouTube Nano Chapters</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --surface: #fff;
+        --button: #f1f3f4;
+        --button-hover: #e5e7e9;
+        --button-active: #dadddf;
+        --text: #202124;
+        --muted: #5f6368;
+        --accent: #1a73e8;
+        --error: #b3261e;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --surface: #292a2d;
+          --button: #3c4043;
+          --button-hover: #484c50;
+          --button-active: #53575b;
+          --text: #f1f3f4;
+          --muted: #bdc1c6;
+          --accent: #8ab4f8;
+          --error: #f2b8b5;
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        width: 192px;
+        margin: 0;
+        padding: 8px 10px;
+        background: var(--surface);
+        color: var(--text);
+        font: 13px/1.4 system-ui, sans-serif;
+      }
+
+      button {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        width: 100%;
+        min-height: 36px;
+        padding: 8px 12px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--button);
+        color: var(--text);
+        font: inherit;
+        font-weight: 500;
+        cursor: pointer;
+      }
+
+      button:hover:not(:disabled) { background: var(--button-hover); }
+      button:active:not(:disabled) { background: var(--button-active); }
+      button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      button:disabled { color: var(--muted); cursor: default; }
+      body[data-state="working"] button { cursor: progress; }
+
+      #status {
+        margin: 8px 4px 2px;
+        color: var(--muted);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+        white-space: pre-line;
+      }
+
+      #status:empty { display: none; }
+      body[data-state="error"] #status { color: var(--error); }
+
+      /* Only a device with the model can name chapters again, so the arrow rides the button in that state alone. */
+      #again {
+        position: absolute;
+        right: 10px;
+        width: 15px;
+        height: 15px;
+      }
+
+      #again[hidden] { display: none; }
+
+      #offer {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      #offer[hidden] { display: none; }
+      #offer input { margin: 1px 0 0; accent-color: var(--accent); }
+    </style>
+  </head>
+  <body data-state="idle">
+    <button id="create" type="button" aria-describedby="status"><span id="label" aria-live="polite">Generate chapters</span><svg id="again" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" hidden><path d="M20 12a8 8 0 1 1-2.3-5.6" /><path d="M20 4v4h-4" /></svg></button>
+    <p id="status" role="status" aria-live="polite" aria-atomic="true"></p>
+    <div id="offer" hidden>
+      <input id="opt-in" type="checkbox" />
+      <label for="opt-in">Better titles with Chrome AI</label>
+    </div>
+    <script src="chapters.js"></script>
+    <script src="generation.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "name": "youtube-nano-chapters",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}

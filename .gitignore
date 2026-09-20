@@ -1,0 +1,9 @@
+dist/
+node_modules/
+evaluation/
+.claude/
+STORE.md
+AGENTS.md
+CLAUDE.md
+dev-reload.html
+dev-reload.js
