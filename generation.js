@@ -584,8 +584,7 @@ function sectionCues(transcript, starts) {
 
 // Keyword titler. A topic the section head announces ("let's talk about price", "mistake five, wrong strength line")
 // wins when the section repeats it; otherwise TF-IDF-ranked noun phrases across the video's sections, a second repeated
-// noun for lone words, and Intro, Outro or "<subject> Overview" for short or subject-only edge sections. Chosen by
-// blinded review over several variants; see evaluation/RESULTS.md.
+// noun for lone words, and Intro, Outro or "<subject> Overview" for short or subject-only edge sections.
 const AN_NUM = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split(" ");
 const AN_HEAD = "step|stage|tip|mistake|reason|rule|principle|lesson|level|method|point|part|chapter|sauce|bowl|workout|question|secret|sign|habit|trick|strategy|exercise|day|factor|benefit|feature|tool|phase|consideration|advice";
 const AN_END = new Set("once anywhere somewhere everywhere however quite shall may might must whose since although though while unless until nor yet onto without after before under among per unlike too ever never always already still even only again now today alright anyway anyways cuz versus using lets".split(" "));
