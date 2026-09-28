@@ -1,14 +1,7 @@
-// Shared by the popup and the live evaluation runner. Each call owns its model session.
-async function generateChapters({
-  resolveVideo, executeScript, controller,
-  ...observers
-}) {
-  let video;
-  try { video = await resolveVideo(); }
-  catch (error) { controller.abort(); throw error; }
-  const { tabId, videoId } = video;
+// Shared by the service worker and the live evaluation runner. Each call owns its model session.
+async function generateChapters({ tabId, videoId, executeScript, ...options }) {
   return generateChapterData({
-    ...observers, controller,
+    ...options,
     loadTranscript: async () => (await executeScript({
       target: { tabId }, world: "MAIN", func: fetchTranscript, args: [videoId],
     }))[0]?.result,
@@ -49,9 +42,9 @@ async function preloadModel(signal) {
   return LanguageModel.create({ ...MODEL_OPTIONS, signal });
 }
 
-// Starts the one-time model download. Chrome only allows it from a click, and it is deliberately not tied to the
-// popup's controller: closing the popup ends the progress reports, not the download. A failure is silent, because
-// chapters are named in code either way.
+// Starts the one-time model download. Chrome only allows it from a click, and it deliberately takes no signal: closing
+// the popup ends the progress reports, not the download. A failure is silent, because chapters are named in code
+// either way.
 function startModelDownload(onProgress = () => {}) {
   if (typeof LanguageModel === "undefined") return;
   LanguageModel.create({
@@ -62,7 +55,7 @@ function startModelDownload(onProgress = () => {}) {
   }).then((session) => session.destroy()).catch(() => {});
 }
 
-// The popup supplies retrieval/rendering; evaluations supply the saved reader output.
+// generateChapters supplies retrieval/rendering; evaluations supply the saved reader output.
 async function generateChapterData({
   loadTranscript, consumeChapters, controller, warmSession = null, useModel = false, fallbackTitles = false,
   onMeasure = () => {}, onOutput = () => {},
@@ -95,8 +88,9 @@ async function generateChapterData({
         }
       }
       controller.signal.throwIfAborted();
-      // A model that went away between the popup's read and this one leaves the chapters to the keyword titler.
-      if (availability === "unavailable") {
+      // Only a model already on the device names chapters. One still to download is never fetched here, so only the
+      // popup's download offer starts one.
+      if (availability !== "available") {
         if (!fallbackTitles) throw new Error("Gemini Nano unavailable");
         useModel = false;
       }
@@ -104,7 +98,7 @@ async function generateChapterData({
     if (useModel) {
       const modelStarted = Date.now();
       pendingSessions++;
-      // A session the popup started on opening is used as is; a failed or missing one starts a fresh session.
+      // A session started when the popup opened is used as is; a failed or missing one starts a fresh session.
       modelPromise = Promise.resolve(warmSession).catch(() => null).then((warm) => warm || LanguageModel.create({
         ...modelOptions,
         signal: controller.signal,
@@ -132,7 +126,7 @@ async function generateChapterData({
     });
 
     const [, transcript] = await Promise.all([
-      // A model that never starts leaves the popup to name the chapters in code.
+      // A model that never starts leaves the chapters to the keyword titler.
       fallbackTitles ? modelPromise.catch(() => null) : modelPromise,
       transcriptPromise,
     ]);
@@ -587,7 +581,7 @@ async function fetchTranscript(expectedVideoId) {
     assertVideo();
     return { cues: cues.filter((cue) => Number.isFinite(cue.time) && cue.time >= 0 && cue.time < duration && cue.text), duration, title: playerResponse.videoDetails.title };
   } catch (error) {
-    // Chrome does not propagate MAIN-world exceptions to the popup.
+    // Chrome does not propagate MAIN-world exceptions to the caller.
     return { error: error.message || "Transcript unavailable" };
   } finally {
     if (!transcriptWasOpen && new URL(location.href).searchParams.get("v") === expectedVideoId) {

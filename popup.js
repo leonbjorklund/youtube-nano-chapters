@@ -7,21 +7,44 @@ const optIn = document.querySelector("#opt-in");
 let generationStarted = false;
 let adTimer;
 let popupClosed = false;
-// Nano names the chapters only when the model is already on the device; otherwise they are named in code.
+// With the model already on the device, it loads early and the popup offers to name the chapters again.
 let modelReady = false;
 let downloadNote = "";
 // One download per popup: an ad or a failed run must not offer the box again and start a second one.
 let downloadStarted = false;
-// When the popup opens on a video that can generate and the model is already on the device, the model starts
-// loading at once, so the click pays no startup.
-let warmSession = null;
-let warmController = null;
 window.addEventListener("pagehide", () => {
   popupClosed = true;
   clearTimeout(adTimer);
-  warmController?.abort();
-  warmSession?.then((session) => session?.destroy()).catch(() => {});
 }, { once: true });
+
+// Generation runs in the service worker (background.js), so it goes on and draws the chapters after the popup
+// closes. Over this connection the popup asks whether its video is being worked on and hears how a run it follows
+// ends; the connection closes with the popup, which lets the worker release a model loaded for a click that never came.
+let worker = null;
+const replies = {};
+function send(message) {
+  if (!worker) {
+    worker = chrome.runtime.connect();
+    worker.onMessage.addListener((reply) => {
+      for (const [key, value] of Object.entries(reply)) {
+        replies[key]?.(value);
+        delete replies[key];
+      }
+    });
+    // An idle worker stops after 30 seconds and takes the connection with it; the next message opens a new one. A
+    // worker that stops before it answers leaves nothing to follow, and one that stops mid-run ends that run.
+    worker.onDisconnect.addListener(() => {
+      worker = null;
+      replies.running?.(false);
+      replies.ended?.({ error: "Couldn't generate chapters" });
+      delete replies.running;
+      delete replies.ended;
+    });
+  }
+  worker.postMessage(message);
+}
+// The worker's next reply under this key.
+const reply = (key) => new Promise((resolve) => { replies[key] = resolve; });
 
 // One read of the model per popup. The offer appears only where ticking it does something: Chrome has the model
 // ready to fetch. A finished download makes it "available" and the box never returns; a download that died leaves
@@ -33,10 +56,10 @@ const modelState = (async () => {
   return { offerDownload: availability === "downloadable" };
 })();
 
+// When the popup shows a video that can generate and the model is already on the device, the worker starts loading
+// the model at once, so the click pays no startup. The worker keeps at most one such model per popup.
 function warmModel() {
-  if (warmSession || popupClosed || !modelReady) return;
-  warmController = new AbortController();
-  warmSession = preloadModel(warmController.signal).catch(() => null);
+  if (modelReady) send({ warmUp: true });
 }
 
 function showState(state, text, message = "") {
@@ -57,41 +80,36 @@ function showDownload(loaded) {
   if (!popupClosed && ["idle", "success"].includes(document.body.dataset.state)) status.textContent = downloadNote;
 }
 
-button.addEventListener("click", async () => {
+button.addEventListener("click", () => {
   if (button.disabled) return;
-  generationStarted = true;
   // Chrome starts the download only from a click, so this stays ahead of every await in the handler.
   if (!offer.hidden && optIn.checked) {
     offer.hidden = true;
     downloadStarted = true;
     startModelDownload(showDownload);
   }
-  const controller = new AbortController();
-  const close = () => controller.abort();
-  window.addEventListener("pagehide", close, { once: true });
+  return follow(activeVideo().then((video) => {
+    const ended = reply("ended");
+    send({ generate: video });
+    return ended;
+  }));
+});
+
+// Shows a run working until it ends, then how it ended.
+async function follow(run) {
+  generationStarted = true;
   showState("working", "Generating chapters...");
-  const warm = warmSession;
-  const warmAbort = warmController;
-  warmSession = null;
-  warmController = null;
-  // Closing the popup during generation also cancels a model still loading for it.
-  controller.signal.addEventListener("abort", () => warmAbort?.abort(), { once: true });
-  // A click in the popup's first moment can beat the model read; the run waits for it rather than falling back.
-  await modelState;
   try {
-    await generateChapters({
-      resolveVideo: activeVideo,
-      executeScript: (injection) => chrome.scripting.executeScript(injection),
-      controller, warmSession: warm, useModel: modelReady, fallbackTitles: true,
-    });
+    const { error } = await run;
+    if (error) throw new Error(error);
+    // Whether Nano can name the chapters again comes from the model read, which a click in the popup's first moment
+    // can beat.
+    await modelState;
     showState("success", "Chapters added", downloadNote);
   } catch (error) {
-    console.error(error);
     showError(error);
-  } finally {
-    window.removeEventListener("pagehide", close);
   }
-});
+}
 
 function showError(error) {
   if (error.message === "Open a YouTube video") {
@@ -103,10 +121,7 @@ function showError(error) {
       adTimer = setTimeout(() => showVideoState(true), 750);
     }
   } else {
-    const messages = [
-      "Transcript unavailable", "Video changed", "Video still loading",
-      "Can't access this video",
-    ];
+    const messages = ["Video changed", "Video still loading", "Can't access this video"];
     showState("error", "Try again", messages.includes(error.message) ? error.message : "Couldn't generate chapters");
   }
 }
@@ -126,15 +141,23 @@ async function showVideoState(recoveringFromAd = false) {
   const canUpdate = () => !popupClosed && (!generationStarted ||
     (recoveringFromAd && document.body.dataset.state === "blocked" && status.textContent === "Wait for the ad to finish"));
   try {
-    const { tabId, videoId } = await activeVideo();
+    const video = await activeVideo();
     if (!canUpdate()) return;
-    const [injection, { offerDownload }] = await Promise.all([
-      chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: readChapterState, args: [videoId] }),
-      modelState,
+    // A popup that opens while its video is being worked on follows that run.
+    const running = reply("running");
+    const ended = reply("ended");
+    send({ watch: video });
+    const [injection, { offerDownload }, working] = await Promise.all([
+      chrome.scripting.executeScript({
+        target: { tabId: video.tabId }, world: "MAIN", func: readChapterState, args: [video.videoId],
+      }),
+      modelState, running,
     ]);
     const result = injection[0];
     if (canUpdate()) {
-      if (result?.result?.blocked) showError(new Error(result.result.blocked));
+      if (working) follow(ended);
+      else if (result?.result?.blocked) showError(new Error(result.result.blocked));
+      else if (result?.result?.transcript === false) showState("unavailable", "Video has no transcript");
       else {
         showState("idle", "Generate chapters", result?.result?.native ? "Video already has chapters" : downloadNote);
         offer.hidden = !offerDownload || downloadStarted;
@@ -154,14 +177,17 @@ function readChapterState(expectedVideoId) {
   const player = document.querySelector("#movie_player");
   const response = player?.getPlayerResponse?.();
   const duration = Number(player?.getDuration?.());
+  const current = response?.videoDetails?.videoId === expectedVideoId;
   const blocked = player?.classList?.contains("ad-showing") ? "Wait for the ad to finish" :
-    response?.videoDetails?.videoId === expectedVideoId && duration > 0 && duration < 4 ? "Video too short" : "";
+    current && duration > 0 && duration < 4 ? "Video too short" : "";
+  // The transcript is read from the captions the player lists, so a video that lists none has no transcript. A player
+  // still showing another video says nothing about this one.
+  const transcript = !current || Boolean(response.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length);
   // Read the current player's chapter data, not the shared "In this video" button.
   const next = player?.getWatchNextResponse?.();
   const markers = next?.playerOverlays?.playerOverlayRenderer?.decoratedPlayerBarRenderer
     ?.decoratedPlayerBarRenderer?.playerBar?.multiMarkersPlayerBarRenderer?.markersMap;
-  const native = response?.videoDetails?.videoId === expectedVideoId &&
-    next?.currentVideoEndpoint?.watchEndpoint?.videoId === expectedVideoId &&
+  const native = current && next?.currentVideoEndpoint?.watchEndpoint?.videoId === expectedVideoId &&
     Array.isArray(markers) && markers.some((marker) => {
       const chapters = marker?.value?.chapters;
       return Array.isArray(chapters) && chapters.length > 1 && chapters.every((entry, index) => {
@@ -174,7 +200,7 @@ function readChapterState(expectedVideoId) {
           (index === 0 ? start === 0 : start > chapters[index - 1].chapterRenderer.timeRangeStartMillis);
       });
     });
-  return { blocked, native };
+  return { blocked, native, transcript };
 }
 
 const initialState = showVideoState();

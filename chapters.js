@@ -43,7 +43,7 @@ function injectChapters(chapters, expectedVideoId) {
     #nano-chapters-panel .nano-chapters-thumbnail { position:relative; width:100px; height:56px; overflow:hidden; border-radius:4px; flex:none; background:var(--yt-spec-10-percent-layer,rgba(255,255,255,.1)); }
     #nano-chapters-panel .nano-chapters-thumbnail img { position:absolute; max-width:none; object-fit:cover; }
     #nano-chapters-panel .nano-chapters-copy { min-width:0; }
-    #nano-chapters-panel .nano-chapters-name { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; font-weight:500; line-height:20px; }
+    #nano-chapters-panel .nano-chapters-name { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; max-height:40px; overflow:hidden; text-overflow:ellipsis; white-space:normal; font-size:14px; font-weight:500; line-height:20px; }
     #nano-chapters-panel .nano-chapters-timestamp { display:inline-block; margin-top:4px; padding:2px 6px; border-radius:4px; background:rgba(62,166,255,.2); color:var(--yt-spec-call-to-action,#3ea6ff); font-size:12px; font-weight:500; line-height:16px; }
     #nano-chapters-panel button:focus-visible { outline:2px solid var(--yt-spec-call-to-action,#3ea6ff); outline-offset:-2px; }
     #panels.nano-chapters-panel-open > ytd-engagement-panel-section-list-renderer { display:none!important; }

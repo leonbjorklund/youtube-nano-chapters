@@ -10,12 +10,16 @@ const generated = {
   chapter3: { timestamp: 360, title: "Generated tradeoffs of battery & comfort" }, // 40 characters, the longest label the schema allows
   chapter4: { timestamp: 540, title: "Generated conclusion" },
 };
-const tick = () => new Promise((resolve) => setImmediate(resolve));
+// Messages between the popup and the service worker arrive in later tasks, as in Chrome, so settling takes a few.
+const tick = async () => {
+  for (let task = 0; task < 8; task++) await new Promise((resolve) => setImmediate(resolve));
+};
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
   return { promise, resolve };
 }
+const source = (file) => readFileSync(path.join(__dirname, file), "utf8");
 
 function popup(options = {}) {
   const calls = [];
@@ -29,71 +33,27 @@ function popup(options = {}) {
   const reads = [];
   const prompts = [];
   const timers = new Map();
-  const window = new EventTarget();
-  const body = { dataset: { state: "idle" } };
-  const status = { textContent: "" };
-  const labels = ["Generate chapters"];
-  let click;
   let timerId = 0;
   let now = 1_000;
   class Clock extends Date { static now() { return now; } }
-  const attributes = {};
-  const button = {
-    disabled: false,
-    addEventListener(event, listener) {
-      assert.equal(event, "click");
-      click = listener;
-    },
-    setAttribute(name, value) { attributes[name] = value; },
-    removeAttribute(name) { delete attributes[name]; },
-  };
-  // The button's words live in their own span, beside the circular arrow that offers another naming.
-  const label = {
-    get textContent() { return labels.at(-1); },
-    set textContent(value) {
-      if (value !== labels.at(-1)) labels.push(value);
-    },
-  };
-  // The arrow is an SVG element: no hidden property, only the attribute.
-  const again = {
-    attributes: new Set(["hidden"]),
-    hasAttribute(name) { return this.attributes.has(name); },
-    toggleAttribute(name, force) {
-      if (force) this.attributes.add(name); else this.attributes.delete(name);
-      return force;
-    },
-  };
-  const offer = { hidden: true };
-  const optIn = { checked: false };
-  const elements = { "#create": button, "#label": label, "#again": again, "#status": status, "#offer": offer, "#opt-in": optIn };
-  const queried = new Set();
   const tab = options.tab === undefined
     ? { id: 42, url: "https://www.youtube.com/watch?v=original-video" }
     : options.tab;
-  const context = vm.createContext({
+  const globals = {
     URL,
     AbortController,
     Date: Clock,
-    window,
     setTimeout(callback, delay) {
       timers.set(++timerId, { callback, delay });
       return timerId;
     },
     clearTimeout(id) { timers.delete(id); },
     console: { error: (error) => errors.push(error) },
-    document: {
-      body,
-      querySelector(selector) {
-        assert.ok(Object.hasOwn(elements, selector), selector);
-        queried.add(selector);
-        return elements[selector];
-      },
-    },
     ...(options.missingApi ? {} : { LanguageModel: {
       availability: async () => {
         if (options.availabilityReady) await options.availabilityReady;
         reads.push("availability");
-        // A model that goes away between the popup's read and generation's read.
+        // A model that goes away after the popup's read.
         return (reads.length > 1 && options.availabilityAfter) || options.availability || "available";
       },
       create(modelOptions) {
@@ -141,83 +101,180 @@ function popup(options = {}) {
         return creation;
       },
     } }),
-    chrome: {
-      tabs: { query: async () => {
-        if (options.tabReady) await options.tabReady;
-        return tab ? [tab] : [];
-      } },
-      scripting: {
-        async executeScript(injection) {
-          if (injection.func.name === "readChapterState") {
-            inspections.push(injection);
-            if (options.inspectionReady) await options.inspectionReady;
-            if (options.inspectionError) throw options.inspectionError;
-            return [{ result: options.chapterState || { native: false } }];
-          }
-          calls.push(injection);
-          if (injection.func.name === "fetchTranscript") {
-            if (options.transcriptReady) await options.transcriptReady;
-            if (options.transcriptError) throw options.transcriptError;
-            if (options.transcriptResultError) return [{ result: { error: options.transcriptResultError } }];
-            if (Object.hasOwn(options, "transcriptResult")) return [{ result: options.transcriptResult }];
-            // A later tab URL must not replace the identity captured on click.
-            tab.url = "https://www.youtube.com/watch?v=different-video";
-            return [{ result: {
-              duration: 720,
-              // Announced topics at 180, 360 and 540 become the generated starts.
-              cues: [
-                { time: 0, text: "Transcript about architecture." },
-                { time: 180, text: "Next, the architecture itself." },
-                { time: 360, text: "Next, tradeoffs between battery life and comfort." },
-                { time: 540, text: "Next, the conclusion." },
-              ],
-              title: "Architecture talk",
-            } }];
-          }
-          if (options.rendererError) throw options.rendererError;
-          if (options.rendererResultError) return [{ result: { error: options.rendererResultError } }];
-          return [{ result: { count: injection.args[0].length } }];
+  };
+  const tabs = { query: async () => {
+    if (options.tabReady) await options.tabReady;
+    return tab ? [tab] : [];
+  } };
+  const scripting = {
+    async executeScript(injection) {
+      if (injection.func.name === "readChapterState") {
+        inspections.push(injection);
+        if (options.inspectionReady) await options.inspectionReady;
+        if (options.inspectionError) throw options.inspectionError;
+        return [{ result: options.chapterState || { native: false } }];
+      }
+      calls.push(injection);
+      if (injection.func.name === "fetchTranscript") {
+        if (options.transcriptReady) await options.transcriptReady;
+        if (options.transcriptError) throw options.transcriptError;
+        if (options.transcriptResultError) return [{ result: { error: options.transcriptResultError } }];
+        if (Object.hasOwn(options, "transcriptResult")) return [{ result: options.transcriptResult }];
+        // A later tab URL must not replace the identity captured on click.
+        tab.url = "https://www.youtube.com/watch?v=different-video";
+        return [{ result: {
+          duration: 720,
+          // Announced topics at 180, 360 and 540 become the generated starts.
+          cues: [
+            { time: 0, text: "Transcript about architecture." },
+            { time: 180, text: "Next, the architecture itself." },
+            { time: 360, text: "Next, tradeoffs between battery life and comfort." },
+            { time: 540, text: "Next, the conclusion." },
+          ],
+          title: "Architecture talk",
+        } }];
+      }
+      if (options.rendererError) throw options.rendererError;
+      if (options.rendererResultError) return [{ result: { error: options.rendererResultError } }];
+      return [{ result: { count: injection.args[0].length } }];
+    },
+  };
+
+  // The service worker, where generation runs. It lives on while popups open and close.
+  const onConnect = [];
+  const workerEnds = [];
+  const worker = vm.createContext({
+    ...globals,
+    chrome: { scripting, runtime: { onConnect: { addListener: (listener) => onConnect.push(listener) } } },
+    importScripts: (...files) => files.forEach((file) => vm.runInContext(source(file), worker, { filename: file })),
+  });
+  vm.runInContext(source("background.js"), worker, { filename: "background.js" });
+
+  // A connection whose ends each hear the other's messages and closing a task later, as in Chrome.
+  function connect() {
+    const ends = [{ message: [], disconnect: [] }, { message: [], disconnect: [] }];
+    let connected = true;
+    const end = (own, other) => ({
+      onMessage: { addListener: (listener) => ends[own].message.push(listener) },
+      onDisconnect: { addListener: (listener) => ends[own].disconnect.push(listener) },
+      postMessage(message) {
+        if (!connected) throw new Error("Attempting to use a disconnected port object");
+        const copy = JSON.parse(JSON.stringify(message));
+        setImmediate(() => { if (connected) ends[other].message.forEach((listener) => listener(copy)); });
+      },
+      disconnect() {
+        if (!connected) return;
+        connected = false;
+        setImmediate(() => ends[other].disconnect.forEach((listener) => listener()));
+      },
+    });
+    setImmediate(() => {
+      const workerEnd = end(1, 0);
+      workerEnds.push(workerEnd);
+      onConnect.forEach((listener) => listener(workerEnd));
+    });
+    return end(0, 1);
+  }
+
+  function open() {
+    const window = new EventTarget();
+    const body = { dataset: { state: "idle" } };
+    const status = { textContent: "" };
+    const labels = ["Generate chapters"];
+    const ports = [];
+    let click;
+    const attributes = {};
+    const button = {
+      disabled: false,
+      addEventListener(event, listener) {
+        assert.equal(event, "click");
+        click = listener;
+      },
+      setAttribute(name, value) { attributes[name] = value; },
+      removeAttribute(name) { delete attributes[name]; },
+    };
+    // The button's words live in their own span, beside the circular arrow that offers another naming.
+    const label = {
+      get textContent() { return labels.at(-1); },
+      set textContent(value) {
+        if (value !== labels.at(-1)) labels.push(value);
+      },
+    };
+    // The arrow is an SVG element: no hidden property, only the attribute.
+    const again = {
+      attributes: new Set(["hidden"]),
+      hasAttribute(name) { return this.attributes.has(name); },
+      toggleAttribute(name, force) {
+        if (force) this.attributes.add(name); else this.attributes.delete(name);
+        return force;
+      },
+    };
+    const offer = { hidden: true };
+    const optIn = { checked: false };
+    const elements = { "#create": button, "#label": label, "#again": again, "#status": status, "#offer": offer, "#opt-in": optIn };
+    const queried = new Set();
+    const context = vm.createContext({
+      ...globals,
+      window,
+      document: {
+        body,
+        querySelector(selector) {
+          assert.ok(Object.hasOwn(elements, selector), selector);
+          queried.add(selector);
+          return elements[selector];
         },
       },
-    },
-  });
+      chrome: { tabs, scripting, runtime: { connect: () => ports[ports.push(connect()) - 1] } },
+    });
 
-  // Load the production scripts in the same order as the popup.
-  const html = readFileSync(path.join(__dirname, "popup.html"), "utf8");
-  const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(scripts, ["chapters.js", "generation.js", "popup.js"]);
-  for (const script of scripts) {
-    vm.runInContext(readFileSync(path.join(__dirname, script), "utf8"), context, { filename: script });
+    // Load the production scripts in the same order as the popup.
+    const html = source("popup.html");
+    const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map((match) => match[1]);
+    assert.deepEqual(scripts, ["generation.js", "popup.js"]);
+    for (const script of scripts) vm.runInContext(source(script), context, { filename: script });
+    // Every element the popup reaches for must exist in the markup under that id, and the popup must reach for all
+    // of them: a renamed id would otherwise break the popup without breaking a test.
+    const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
+    assert.deepEqual([...queried].sort(), Object.keys(elements).sort());
+    for (const selector of queried) assert.ok(ids.has(selector.slice(1)), `${selector} is missing from popup.html`);
+    // The button's words change under the pointer, so a screen reader is told when they do.
+    assert.match(html, /<span id="label"[^>]*aria-live="polite"/);
+
+    return {
+      button, label, again, offer, optIn, status, body, attributes, labels,
+      ready: vm.runInContext("initialState", context),
+      readChapterState: vm.runInContext("readChapterState", context),
+      click: () => click(),
+      // Closing the popup ends its page and, with it, its connections to the worker.
+      close() {
+        window.dispatchEvent(new Event("pagehide"));
+        ports.forEach((port) => port.disconnect());
+      },
+    };
   }
-  // Every element the popup reaches for must exist in the markup under that id, and the popup must reach for all
-  // of them: a renamed id would otherwise break the popup without breaking a test.
-  const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
-  assert.deepEqual([...queried].sort(), Object.keys(elements).sort());
-  for (const selector of queried) assert.ok(ids.has(selector.slice(1)), `${selector} is missing from popup.html`);
-  // The button's words change under the pointer, so a screen reader is told when they do.
-  assert.match(html, /<span id="label"[^>]*aria-live="polite"/);
 
   return {
-    button, label, again, offer, optIn, status, body, attributes, createCalls, calls, inspections, errors, sessions, clones, prompts, timers, labels,
-    ready: vm.runInContext("initialState", context),
-    readChapterState: vm.runInContext("readChapterState", context),
-    click: () => click(),
-    renderer: vm.runInContext("injectChapters", context),
-    fetchTranscript: vm.runInContext("fetchTranscript", context),
-    buildTitlePrompt: vm.runInContext("buildTitlePrompt", context),
-    selectStarts: vm.runInContext("selectStarts", context),
-    splitAtStarts: vm.runInContext("splitAtStarts", context),
-    nameChapters: vm.runInContext("nameChapters", context),
-    sectionCues: vm.runInContext("sectionCues", context),
-    tidyTitle: vm.runInContext("tidyTitle", context),
-    withKeywords: vm.runInContext("withKeywords", context),
-    generateChapterData: vm.runInContext("generateChapterData", context),
+    ...open(),
+    createCalls, calls, inspections, errors, sessions, clones, prompts, timers,
+    // Another popup on the same tab, beside the same worker.
+    reopen: open,
+    // Chrome stops the worker, which closes its connections.
+    stopWorker: () => workerEnds.forEach((port) => port.disconnect()),
+    renderer: vm.runInContext("injectChapters", worker),
+    fetchTranscript: vm.runInContext("fetchTranscript", worker),
+    buildTitlePrompt: vm.runInContext("buildTitlePrompt", worker),
+    selectStarts: vm.runInContext("selectStarts", worker),
+    splitAtStarts: vm.runInContext("splitAtStarts", worker),
+    nameChapters: vm.runInContext("nameChapters", worker),
+    sectionCues: vm.runInContext("sectionCues", worker),
+    tidyTitle: vm.runInContext("tidyTitle", worker),
+    withKeywords: vm.runInContext("withKeywords", worker),
+    generateChapterData: vm.runInContext("generateChapterData", worker),
     destroyed: () => sessions.reduce((total, session) => total + session.destroyed, 0),
     prompted: () => prompts.length,
     modelCreated: (index = 0) => creations[index],
     reportProgress: (loaded, index = 0) => downloads[index]({ loaded }),
     advance: (milliseconds) => { now += milliseconds; },
-    close: () => window.dispatchEvent(new Event("pagehide")),
     async checkAd() {
       const entry = [...timers].find(([, timer]) => timer.delay === 750);
       assert.ok(entry, "ad state schedules a recheck");
@@ -256,7 +313,7 @@ function assertSuccess(app, { modelOnDevice = true, message = "" } = {}) {
   assert.equal(app.status.textContent, message);
 }
 
-// The harness transcript, as the popup's own reader returns it.
+// The harness transcript, as the production reader returns it.
 const harnessTranscript = {
   duration: 720,
   cues: [
@@ -325,30 +382,77 @@ test("closing the popup without a click destroys the early session", async () =>
   assert.equal(app.destroyed(), 1);
 });
 
-test("closing the popup after a click that waits on the early session aborts its loading", async () => {
-  const model = deferred();
-  const app = popup({ modelReady: model.promise });
+// Generation runs in the service worker, so a popup closed at any point of a run still gets its chapters.
+for (const [stage, option] of [
+  ["the early session loads", "modelReady"],
+  ["the transcript loads", "transcriptReady"],
+  ["Nano writes titles", "promptReady"],
+]) {
+  test(`closing the popup while ${stage} still draws the chapters`, async () => {
+    const wait = deferred();
+    const app = popup({ [option]: wait.promise });
+    await app.ready;
+    app.click();
+    await tick();
+    app.close();
+    await tick();
+    assert.equal(app.sessions[0].signal.aborted, false, "the run keeps the model it waits for");
+    wait.resolve();
+    await tick();
+    assert.equal(app.calls.length, 2);
+    assert.equal(app.calls[1].func, app.renderer);
+    assert.equal(JSON.parse(JSON.stringify(app.calls[1].args[0]))[0].title, "Generated opening");
+    assert.equal(app.sessions.length, 1);
+    assert.equal(app.destroyed(), 1);
+    assert.equal(app.timers.size, 0);
+  });
+}
+
+test("a popup opened during a run shows it working, follows it to the end and starts no second run", async () => {
+  const titles = deferred();
+  const app = popup({ promptReady: titles.promise, transcriptResult: harnessTranscript });
   await app.ready;
+  app.click();
   await tick();
-  assert.equal(app.sessions.length, 1);
-  const run = app.click();
-  await tick();
-  assert.equal(app.sessions[0].signal.aborted, false);
   app.close();
-  assert.equal(app.sessions[0].signal.aborted, true);
-  model.resolve();
-  await run;
-  assert.equal(app.destroyed(), 1);
-  assert.equal(app.prompted(), 0);
+  const watching = app.reopen();
+  await watching.ready;
+  assert.equal(watching.body.dataset.state, "working");
+  assert.equal(watching.button.disabled, true);
+  assert.equal(watching.label.textContent, "Generating chapters...");
+  // A click before the popup has read the tab joins the run too.
+  const clicking = app.reopen();
+  clicking.click();
+  await tick();
+  titles.resolve();
+  await tick();
+  assertSuccess(watching);
+  assertSuccess(clicking);
+  assert.equal(app.calls.filter((call) => call.func === app.renderer).length, 1);
+  assert.equal(app.prompted(), 1);
+  assert.equal(app.sessions.length, 1, "a popup that finds a run loads no model of its own");
 });
 
-test("closing the popup while the early session loads aborts it", async () => {
+test("a worker that stops mid-run ends the popup's run with the general error", async () => {
+  const transcript = deferred();
+  const app = popup({ transcriptReady: transcript.promise });
+  await app.ready;
+  const run = app.click();
+  await tick();
+  assert.equal(app.body.dataset.state, "working");
+  app.stopWorker();
+  await run;
+  assertRetry(app, /Couldn't generate chapters/);
+});
+
+test("closing the popup without a click while the early session loads aborts it", async () => {
   const model = deferred();
   const app = popup({ modelReady: model.promise });
   await app.ready;
   await tick();
   assert.equal(app.sessions.length, 1);
   app.close();
+  await tick();
   assert.equal(app.sessions[0].signal.aborted, true);
   model.resolve();
   await tick();
@@ -425,7 +529,7 @@ test("chapter detection requires structured chapters for the current video", () 
       URL, location: { href: `https://www.youtube.com/watch?v=${videoId}` },
       document: {
         querySelector: (selector) => selector === "#movie_player" ? {
-          getPlayerResponse: () => ({ videoDetails: { videoId: playerId } }),
+          getPlayerResponse: () => ({ videoDetails: { videoId: playerId }, captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } } }),
           ...(next === null ? {} : { getWatchNextResponse: () => next }),
         } : null,
         querySelectorAll: () => [{ textContent: title, closest: () => ({ disabled: false }) }],
@@ -436,7 +540,7 @@ test("chapter detection requires structured chapters for the current video", () 
   assert.equal(detect({ title: "" }).native, true, "chapters do not depend on a visible player title");
   assert.equal(detect({ next: watchNext(markers(chapters, "AUTO_CHAPTERS")) }).native, true);
   // The reader reports only what the page shows; chapters this extension added are not part of it.
-  assert.deepEqual(JSON.parse(JSON.stringify(detect())), { native: true, blocked: "" });
+  assert.deepEqual(JSON.parse(JSON.stringify(detect())), { native: true, blocked: "", transcript: true });
   assert.equal(detect({ next: watchNext(markers(), "previous-video") }).native, false, "stale watch data");
   assert.equal(detect({ playerId: "previous-video" }).native, false, "stale player data");
   assert.equal(detect({ videoId: "different-video" }), null);
@@ -453,6 +557,19 @@ test("chapter detection requires structured chapters for the current video", () 
   ]) {
     assert.equal(detect({ next: watchNext([{ value: { chapters: invalid } }]) }).native, false, "invalid chapter list");
   }
+});
+
+test("a video without a transcript disables generation before a click", async () => {
+  const app = popup({ chapterState: { blocked: "", native: false, transcript: false } });
+  await app.ready;
+  await tick();
+  assert.equal(app.body.dataset.state, "unavailable");
+  assert.equal(app.label.textContent, "Video has no transcript");
+  assert.equal(app.button.disabled, true);
+  assert.equal(app.status.textContent, "");
+  await app.click();
+  assert.equal(app.sessions.length, 0, "no model loads for a video it cannot name");
+  assert.equal(app.calls.length, 0);
 });
 
 test("a short video disables generation before a click", async () => {
@@ -514,6 +631,9 @@ test("an ad encountered on click recovers after model cleanup", async () => {
   assert.equal(app.button.disabled, false);
   assert.equal(app.label.textContent, "Generate chapters");
   assert.equal(app.timers.size, 0);
+  await tick();
+  // The first click used the early model, so the next click gets a fresh one.
+  assert.equal(app.sessions.length, 2);
 });
 
 for (const checkingAd of [false, true]) {
@@ -560,14 +680,14 @@ test("closing the popup stops pending and in-flight ad rechecks", async () => {
 
 test("the production detector distinguishes ad duration from a short loaded video", () => {
   const app = popup();
-  const detect = (ad, duration, videoId = "original-video") => vm.runInNewContext(
+  const detect = (ad, duration, videoId = "original-video", captions = { playerCaptionsTracklistRenderer: { captionTracks: [{}] } }) => vm.runInNewContext(
     `(${app.readChapterState.toString()})("original-video")`, {
       URL, location: { href: "https://www.youtube.com/watch?v=original-video" },
       document: {
         querySelector: (selector) => selector === "#movie_player" ? {
           classList: { contains: () => ad },
           getDuration: () => duration,
-          getPlayerResponse: () => ({ videoDetails: { videoId } }),
+          getPlayerResponse: () => ({ videoDetails: { videoId }, captions }),
         } : null,
         querySelectorAll: () => [],
       },
@@ -577,9 +697,14 @@ test("the production detector distinguishes ad duration from a short loaded vide
   assert.equal(detect(false, 4).blocked, "");
   assert.equal(detect(false, 0).blocked, "");
   assert.equal(detect(false, 3, "previous-video").blocked, "");
+  // Only the player's data for this video can say it has no captions; a player still on another video blocks nothing.
+  assert.equal(detect(false, 600).transcript, true);
+  assert.equal(detect(false, 600, "original-video", null).transcript, false);
+  assert.equal(detect(false, 600, "original-video", { playerCaptionsTracklistRenderer: { captionTracks: [] } }).transcript, false);
+  assert.equal(detect(false, 600, "previous-video", null).transcript, true);
 });
 
-test("popup sends validated model output to the production renderer for the original video", async () => {
+test("a click sends validated model output to the production renderer for the original video", async () => {
   const app = popup();
   await app.ready;
   await app.click();
@@ -634,17 +759,25 @@ test("transcript rejection releases an already created model without prompting",
   assert.equal(app.destroyed(), 1);
 });
 
+test("a failure without a message still reports failure", async () => {
+  const app = popup({ transcriptError: new Error("") });
+  await app.ready;
+  await app.click();
+  assertRetry(app, /Couldn't generate chapters/);
+});
+
 for (const [name, transcriptResult, message] of [
   ["serialized error", { error: "Wait for the ad to finish" }, /ad to finish/],
-  ["missing transcript", null, /Transcript unavailable/],
-  ["empty transcript", { duration: 2400, cues: [] }, /Transcript unavailable/],
+  // The popup names a missing transcript before the click; one found missing after it is an ordinary failure.
+  ["missing transcript", null, /Couldn't generate chapters/],
+  ["empty transcript", { duration: 2400, cues: [] }, /Couldn't generate chapters/],
 ]) {
   test(`${name} aborts model preparation before the session is ready`, async () => {
     const model = deferred();
     const app = popup({ modelReady: model.promise, transcriptResult });
     await app.ready;
     await tick();
-    assert.equal(app.sessions.length, 1, "the popup started the model on opening");
+    assert.equal(app.sessions.length, 1, "the model started loading when the popup opened");
     const run = app.click();
     await tick();
     try {
@@ -722,19 +855,19 @@ test("a stalled batch ends 9 seconds after the click and its chapters keep their
   assertSuccess(app);
 });
 
-// The popup reads the model once on opening. A click in that first moment waits for the read rather than
-// deciding without it.
+// The run reads the model to decide whether Nano names the chapters, and the popup to decide whether it offers to name
+// them again. A click in the popup's first moment waits for both reads rather than deciding without them.
 for (const [name, options, usesModel] of [
   ["a model on the device", {}, true],
   ["no model", { availability: "unavailable" }, false],
 ]) {
-  test(`a click during the model read waits for it, then ${usesModel ? "uses Nano" : "names the chapters in code"}`, async () => {
+  test(`a click during the model reads waits for them, then ${usesModel ? "uses Nano" : "names the chapters in code"}`, async () => {
     const availability = deferred();
     const app = popup({ ...options, availabilityReady: availability.promise });
     const run = app.click();
     await tick();
     assert.equal(app.label.textContent, "Generating chapters...");
-    assert.equal(app.calls.length, 0, "the run waits for the model read");
+    assert.equal(app.calls.length, 0, "the run waits for its model read");
     availability.resolve();
     await run;
     assert.equal(app.prompted(), usesModel ? 1 : 0);
@@ -904,7 +1037,7 @@ test("a model the browser refuses to start leaves the chapters to the keyword ti
   assert.equal(app.errors.length, 0);
 });
 
-test("a model that goes away between the two reads leaves the chapters to the keyword titler", async () => {
+test("a model that goes away after the popup's read leaves the chapters to the keyword titler", async () => {
   const app = popup({ availabilityAfter: "unavailable" });
   await app.ready;
   await tick();
@@ -966,33 +1099,6 @@ test("duplicate clicks while working start only one generation", async () => {
   await first;
   assert.equal(app.prompted(), 1);
   assert.equal(app.calls.length, 2);
-});
-
-test("closing popup aborts generation and prevents its result from rendering", async () => {
-  const prompt = deferred();
-  const app = popup({ promptReady: prompt.promise });
-  await app.ready;
-  const run = app.click();
-  await tick();
-  app.close();
-  assert.equal(app.prompts[0].options.signal.aborted, true);
-  prompt.resolve();
-  await run;
-  assert.equal(app.calls.length, 1);
-  assert.equal(app.destroyed(), 1);
-});
-
-test("closing popup during the tab lookup prevents model and transcript work", async () => {
-  const pending = deferred();
-  const app = popup({ tabReady: pending.promise });
-  const run = app.click();
-  await tick();
-  app.close();
-  pending.resolve();
-  await Promise.all([run, app.ready]);
-  assert.equal(app.sessions.length, 0);
-  assert.equal(app.calls.length, 0);
-  assert.equal(app.timers.size, 0);
 });
 
 for (const [name, options] of [
@@ -1118,24 +1224,6 @@ test("a single JSON fence is accepted without repairing title contents", async (
   await app.click();
   assertSuccess(app);
   assert.equal(app.calls[1].args[0][1].title, generated.chapter2.title);
-});
-
-test("close during title generation destroys the session and renders nothing", async () => {
-  const titles = deferred();
-  const app = popup({ promptReady: titles.promise });
-  await app.ready;
-  const run = app.click();
-  await tick();
-  assert.equal(app.prompted(), 1);
-  assert.equal(app.sessions.length, 1);
-  assert.equal(app.prompts[0].options.signal.aborted, false);
-  app.close();
-  titles.resolve();
-  await run;
-  assert.equal(app.calls.length, 1);
-  assert.equal(app.clones[0].destroyed, 1);
-  assert.equal(app.destroyed(), 1);
-  assert.equal(app.timers.size, 0);
 });
 
 test("title sections contain their selected spans and exclude the next section", () => {
@@ -1484,19 +1572,6 @@ test("a device without the model renders code-named chapters through the product
   assert.equal(app.labels.includes("Generating chapters..."), true);
   assert.equal(app.errors.length, 0);
   assert.equal(app.timers.size, 0, "no generation timeout is armed");
-});
-
-test("closing the popup during transcript retrieval renders nothing", async () => {
-  const transcriptReady = deferred();
-  const app = popup({ availability: "unavailable", transcriptReady: transcriptReady.promise });
-  await app.ready;
-  const clicked = app.click();
-  await tick();
-  app.close();
-  transcriptReady.resolve();
-  await clicked;
-  assert.equal(app.calls.length, 1);
-  assert.equal(app.sessions.length, 0);
 });
 
 test("section cues cover each chapter's span and split a straddling caption", () => {

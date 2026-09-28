@@ -5,7 +5,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed. No release package was created.' }
 
     $manifest = Get-Content -Raw -LiteralPath 'manifest.json' | ConvertFrom-Json
-    $files = @('manifest.json', 'popup.html', 'popup.js', 'chapters.js', 'generation.js')
+    $files = @('manifest.json', 'background.js', 'popup.html', 'popup.js', 'chapters.js', 'generation.js')
     $files += $manifest.icons.PSObject.Properties.Value
     foreach ($file in $files) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
