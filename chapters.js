@@ -3,6 +3,12 @@ function injectChapters(chapters, expectedVideoId) {
   if (expectedVideoId && expectedVideoId !== videoId) {
     return { error: "Video changed" };
   }
+  // Without chapters, a reloaded tab draws again the ones it kept for this video, unless it already shows chapters.
+  if (!chapters) {
+    const kept = JSON.parse(sessionStorage.getItem("nano-chapters"));
+    if (kept?.videoId !== videoId || window.__nanoChaptersCleanup) return null;
+    chapters = kept.chapters;
+  }
   const player = document.querySelector("#movie_player");
   const video = player?.querySelector("video");
   const panels = document.querySelector("#panels");
@@ -333,6 +339,7 @@ function injectChapters(chapters, expectedVideoId) {
     player.classList.remove("nano-chapters-active");
     panels.classList.remove("nano-chapters-panel-open");
     if (window.__nanoChaptersCleanup === cleanup) delete window.__nanoChaptersCleanup;
+    try { sessionStorage.removeItem("nano-chapters"); } catch {}
   }
   window.__nanoChaptersCleanup = cleanup;
   document.addEventListener("yt-navigate-start", cleanup, { signal });
@@ -341,5 +348,7 @@ function injectChapters(chapters, expectedVideoId) {
   }, { signal });
   layout();
   update();
+  // The tab's session storage keeps the chapters for a reload; leaving the video deletes them (cleanup).
+  try { sessionStorage.setItem("nano-chapters", JSON.stringify({ videoId, chapters })); } catch {}
   return { count: chapters.length };
 }

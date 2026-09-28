@@ -39,6 +39,19 @@ chrome.runtime.onConnect.addListener((popup) => {
 
 const runKey = ({ tabId, videoId }) => `${tabId} ${videoId}`;
 
+// A reloaded tab gets back the chapters it kept for its video (see injectChapters). Chrome reports the URL only of a
+// tab the extension may still reach, and YouTube builds the player after the page loads, so drawing waits for it.
+chrome.tabs.onUpdated.addListener(async (tabId, { status }, { url }) => {
+  if (status !== "complete" || !url) return;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId }, world: "MAIN", func: injectChapters, args: [null],
+    }).catch(() => []);
+    if (injection?.result?.error !== "Video still loading") return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+});
+
 // Resolves with the error message, or "" once the chapters are drawn.
 function startRun(video, warm) {
   const controller = new AbortController();

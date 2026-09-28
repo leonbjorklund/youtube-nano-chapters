@@ -157,6 +157,8 @@ async function showVideoState(recoveringFromAd = false) {
     if (canUpdate()) {
       if (working) follow(ended);
       else if (result?.result?.blocked) showError(new Error(result.result.blocked));
+      // The page still shows chapters from an earlier run, whose popup has closed.
+      else if (result?.result?.added) showState("success", "Chapters added", downloadNote);
       else if (result?.result?.transcript === false) showState("unavailable", "Video has no transcript");
       else {
         showState("idle", "Generate chapters", result?.result?.native ? "Video already has chapters" : downloadNote);
@@ -200,7 +202,8 @@ function readChapterState(expectedVideoId) {
           (index === 0 ? start === 0 : start > chapters[index - 1].chapterRenderer.timeRangeStartMillis);
       });
     });
-  return { blocked, native, transcript };
+  // Chapters this extension drew stay on the page until the tab leaves the video.
+  return { blocked, native, transcript, added: Boolean(window.__nanoChaptersCleanup) };
 }
 
 const initialState = showVideoState();

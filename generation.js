@@ -545,6 +545,8 @@ async function fetchTranscript(expectedVideoId) {
   let expandedDescription = false;
 
   try {
+    const requested = await requestTranscript();
+    if (requested?.length) return transcriptOf(requested);
     if (!transcriptWasOpen) {
       document.head.append(hide);
       const findShowButton = () =>
@@ -577,9 +579,7 @@ async function fetchTranscript(expectedVideoId) {
       );
     }
 
-    const cues = [...(findTranscriptPanel()?.querySelectorAll(transcriptSelector) || [])].map(readCue);
-    assertVideo();
-    return { cues: cues.filter((cue) => Number.isFinite(cue.time) && cue.time >= 0 && cue.time < duration && cue.text), duration, title: playerResponse.videoDetails.title };
+    return transcriptOf([...(findTranscriptPanel()?.querySelectorAll(transcriptSelector) || [])].map(readCue));
   } catch (error) {
     // Chrome does not propagate MAIN-world exceptions to the caller.
     return { error: error.message || "Transcript unavailable" };
@@ -603,16 +603,50 @@ async function fetchTranscript(expectedVideoId) {
     );
   }
 
+  // YouTube's newer transcript view loads with one plain request, so it is read without opening the panel. The older
+  // view's request carries a signature only YouTube's own panel adds, so that view, or a failed request, opens the panel.
+  async function requestTranscript() {
+    const next = player?.getWatchNextResponse?.();
+    if (next?.currentVideoEndpoint?.watchEndpoint?.videoId !== expectedVideoId) return null;
+    const params = collect(next, "updateEngagementPanelContentCommand")
+      .find((command) => command.contentSourcePanelIdentifier?.tag === "PAmodern_transcript_view")?.globalConfiguration?.params;
+    if (!params) return null;
+    try {
+      const response = await fetch("/youtubei/v1/get_panel?prettyPrint=false", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ context: ytcfg.get("INNERTUBE_CONTEXT"), panelId: "PAmodern_transcript_view", params }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      return collect(await response.json(), "transcriptSegmentViewModel").map((segment) => cue(segment.timestamp, segment.simpleText));
+    } catch {
+      return null;
+    }
+  }
+
+  // Every value under this key, in document order.
+  function collect(value, key, found = []) {
+    if (value?.[key]) found.push(value[key]);
+    else if (value && typeof value === "object") Object.values(value).forEach((item) => collect(item, key, found));
+    return found;
+  }
+
+  function transcriptOf(cues) {
+    assertVideo();
+    return { cues: cues.filter((cue) => Number.isFinite(cue.time) && cue.time >= 0 && cue.time < duration && cue.text), duration, title: playerResponse.videoDetails.title };
+  }
+
   function readCue(segment) {
-    const parts = segment
-      ?.querySelector(".ytwTranscriptSegmentViewModelTimestamp, .segment-timestamp")
-      ?.textContent.trim()
-      .split(":")
-      .map(Number);
-    const time = parts?.reduce((total, part) => total * 60 + part, 0);
+    return cue(
+      segment?.querySelector(".ytwTranscriptSegmentViewModelTimestamp, .segment-timestamp")?.textContent,
+      segment?.querySelector('[role="text"], .segment-text')?.textContent,
+    );
+  }
+
+  function cue(timestamp, text) {
+    const time = timestamp?.trim().split(":").map(Number).reduce((total, part) => total * 60 + part, 0);
     // Collapsed whitespace keeps a caption from imitating a prompt label on its own line.
-    const text = segment?.querySelector('[role="text"], .segment-text')?.textContent.replace(/\s+/g, " ").trim();
-    return { time, text };
+    return { time, text: text?.replace(/\s+/g, " ").trim() };
   }
 
   async function waitFor(read, timeoutMs) {

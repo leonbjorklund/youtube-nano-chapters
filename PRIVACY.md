@@ -6,13 +6,13 @@ Updated September 28, 2026. Support and privacy contact: [leon.bjorklund@gmail.c
 
 Opening the popup reads the active tab's URL and the video's ID, duration, existing chapters, whether it has captions, and ad state. Generating reads the video's title and transcript, picks chapter starts, and names them with Chrome's on-device Gemini Nano when that model is installed, or in code from the transcript alone when it is not. The chapter panel reads playback position and YouTube thumbnail URLs.
 
-All of this stays in memory. Nothing is saved: no titles, transcripts, chapters, history, or preferences. Reloading or leaving the video removes the generated panel.
+All of this stays on your device. The generated chapters are kept in the YouTube tab's session storage, which belongs to that tab alone, so reloading the video shows them again. Leaving the video deletes them and removes the generated panel. Nothing else is saved: no transcripts, history, or preferences.
 
 ## Network
 
 No backend, analytics, telemetry, accounts, API keys, or cloud AI. Nothing is sent to the developer or any external AI service, and nothing is sold or shared.
 
-Chrome downloads its AI model only when you tick "Better titles with Chrome AI". YouTube still makes its normal video and transcript requests, and the chapter panel loads preview images from YouTube. Chrome and YouTube handle those under their own privacy policies.
+Chrome downloads its AI model only when you tick "Better titles with Chrome AI". The transcript comes from YouTube, through the same request YouTube's transcript panel makes or through that panel itself. YouTube still makes its normal video requests, and the chapter panel loads preview images from YouTube. Chrome and YouTube handle those under their own privacy policies.
 
 ## Permissions
 
@@ -20,4 +20,4 @@ Chrome downloads its AI model only when you tick "Better titles with Chrome AI".
 
 This use complies with the [Chrome Web Store User Data Policy](https://developer.chrome.com/docs/webstore/program-policies/limited-use), including Limited Use. No advertising, profiling, or unrelated purposes.
 
-You choose when generation starts. Once started, it finishes even if you close the popup. There is no saved data to delete.
+You choose when generation starts. Once started, it finishes even if you close the popup. The only saved data, a tab's chapters, is deleted when the tab leaves the video or when Chrome clears the tab's session storage.

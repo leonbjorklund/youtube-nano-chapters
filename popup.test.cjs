@@ -134,6 +134,8 @@ function popup(options = {}) {
           title: "Architecture talk",
         } }];
       }
+      // A reloaded tab's chapters are drawn from what the page kept, so the worker sends none.
+      if (injection.args[0] === null) return [{ result: options.restoreResults.shift() }];
       if (options.rendererError) throw options.rendererError;
       if (options.rendererResultError) return [{ result: { error: options.rendererResultError } }];
       return [{ result: { count: injection.args[0].length } }];
@@ -142,10 +144,15 @@ function popup(options = {}) {
 
   // The service worker, where generation runs. It lives on while popups open and close.
   const onConnect = [];
+  const onUpdated = [];
   const workerEnds = [];
   const worker = vm.createContext({
     ...globals,
-    chrome: { scripting, runtime: { onConnect: { addListener: (listener) => onConnect.push(listener) } } },
+    chrome: {
+      scripting,
+      runtime: { onConnect: { addListener: (listener) => onConnect.push(listener) } },
+      tabs: { onUpdated: { addListener: (listener) => onUpdated.push(listener) } },
+    },
     importScripts: (...files) => files.forEach((file) => vm.runInContext(source(file), worker, { filename: file })),
   });
   vm.runInContext(source("background.js"), worker, { filename: "background.js" });
@@ -260,6 +267,8 @@ function popup(options = {}) {
     reopen: open,
     // Chrome stops the worker, which closes its connections.
     stopWorker: () => workerEnds.forEach((port) => port.disconnect()),
+    // Chrome reports a change to the video's tab.
+    tabUpdated: (change, tabInfo) => onUpdated.forEach((listener) => listener(42, change, tabInfo)),
     renderer: vm.runInContext("injectChapters", worker),
     fetchTranscript: vm.runInContext("fetchTranscript", worker),
     buildTitlePrompt: vm.runInContext("buildTitlePrompt", worker),
@@ -433,6 +442,38 @@ test("a popup opened during a run shows it working, follows it to the end and st
   assert.equal(app.sessions.length, 1, "a popup that finds a run loads no model of its own");
 });
 
+test("a popup opened on chapters an earlier run drew shows them added and names them again", async () => {
+  const app = popup({ chapterState: { native: false, added: true } });
+  await app.ready;
+  assertSuccess(app);
+  await app.click();
+  assertSuccess(app);
+  assert.equal(app.prompted(), 1);
+});
+
+test("a reloaded tab draws its kept chapters again once YouTube has built the player", async () => {
+  const app = popup({ restoreResults: [{ error: "Video still loading" }, { count: 4 }] });
+  await app.ready;
+  const restores = () => app.calls.filter((call) => call.args[0] === null);
+  app.tabUpdated({ status: "loading" }, { url: "https://www.youtube.com/watch?v=original-video" });
+  // Chrome gives no URL for a tab the extension can no longer reach.
+  app.tabUpdated({ status: "complete" }, {});
+  await tick();
+  assert.equal(restores().length, 0);
+  app.tabUpdated({ status: "complete" }, { url: "https://www.youtube.com/watch?v=original-video" });
+  await tick();
+  assert.equal(restores().length, 1);
+  assert.equal(restores()[0].func, app.renderer);
+  assert.equal(restores()[0].world, "MAIN");
+  assert.equal(restores()[0].target.tabId, 42);
+  const [id, retry] = [...app.timers].find(([, timer]) => timer.delay === 500);
+  app.timers.delete(id);
+  retry.callback();
+  await tick();
+  assert.equal(restores().length, 2);
+  assert.ok(![...app.timers.values()].some((timer) => timer.delay === 500), "drawn chapters end the retries");
+});
+
 test("a worker that stops mid-run ends the popup's run with the general error", async () => {
   const transcript = deferred();
   const app = popup({ transcriptReady: transcript.promise });
@@ -524,9 +565,11 @@ test("chapter detection requires structured chapters for the current video", () 
   });
   const markers = (value = chapters, key = "DESCRIPTION_CHAPTERS") => [{ key, value: { chapters: value } }];
   const detect = ({ next = watchNext(markers()), playerId = "original-video", videoId = "original-video",
-    title = "In this video" } = {}) => vm.runInNewContext(
+    title = "In this video", drawn = false } = {}) => vm.runInNewContext(
     `(${app.readChapterState.toString()})("original-video")`, {
       URL, location: { href: `https://www.youtube.com/watch?v=${videoId}` },
+      // Chapters this extension drew leave their cleanup on the page.
+      window: drawn ? { __nanoChaptersCleanup() {} } : {},
       document: {
         querySelector: (selector) => selector === "#movie_player" ? {
           getPlayerResponse: () => ({ videoDetails: { videoId: playerId }, captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } } }),
@@ -539,8 +582,9 @@ test("chapter detection requires structured chapters for the current video", () 
   assert.equal(detect({ next: watchNext(undefined) }).native, false, "Timeline-only video is not chaptered");
   assert.equal(detect({ title: "" }).native, true, "chapters do not depend on a visible player title");
   assert.equal(detect({ next: watchNext(markers(chapters, "AUTO_CHAPTERS")) }).native, true);
-  // The reader reports only what the page shows; chapters this extension added are not part of it.
-  assert.deepEqual(JSON.parse(JSON.stringify(detect())), { native: true, blocked: "", transcript: true });
+  // Chapters this extension drew are reported apart from the video's own.
+  assert.deepEqual(JSON.parse(JSON.stringify(detect())), { native: true, blocked: "", transcript: true, added: false });
+  assert.equal(detect({ drawn: true }).added, true);
   assert.equal(detect({ next: watchNext(markers(), "previous-video") }).native, false, "stale watch data");
   assert.equal(detect({ playerId: "previous-video" }).native, false, "stale player data");
   assert.equal(detect({ videoId: "different-video" }), null);
@@ -682,7 +726,7 @@ test("the production detector distinguishes ad duration from a short loaded vide
   const app = popup();
   const detect = (ad, duration, videoId = "original-video", captions = { playerCaptionsTracklistRenderer: { captionTracks: [{}] } }) => vm.runInNewContext(
     `(${app.readChapterState.toString()})("original-video")`, {
-      URL, location: { href: "https://www.youtube.com/watch?v=original-video" },
+      URL, location: { href: "https://www.youtube.com/watch?v=original-video" }, window: {},
       document: {
         querySelector: (selector) => selector === "#movie_player" ? {
           classList: { contains: () => ad },
@@ -1449,6 +1493,18 @@ test("title prompt uses the video title only as naming context", () => {
   assert.match(untitled, /Labels are at most 40 characters/);
 });
 
+// A video in YouTube's newer transcript view: the description's transcript button names the panel's request, beside
+// the chapter panel's.
+const modernWatchNext = {
+  currentVideoEndpoint: { watchEndpoint: { videoId: "original-video" } },
+  engagementPanels: [{ engagementPanelSectionListRenderer: { content: { structuredDescriptionContentRenderer: { items: [
+    { videoDescriptionTranscriptSectionRenderer: { primaryButton: { buttonRenderer: { command: { commandExecutorCommand: { commands: [
+      { updateEngagementPanelContentCommand: { contentSourcePanelIdentifier: { tag: "engagement-panel-macro-markers-description-chapters" } } },
+      { updateEngagementPanelContentCommand: { contentSourcePanelIdentifier: { tag: "PAmodern_transcript_view" }, globalConfiguration: { params: "modern-params" } } },
+    ] } } } } } },
+  ] } } } }],
+};
+
 for (const [format, panelLayout] of [
   ["legacy", "legacy"],
   ["modern", "legacy"],
@@ -1496,10 +1552,18 @@ for (const [format, panelLayout] of [
       };
       let clock = 0;
       const styles = [];
+      let requests = 0;
       const result = await vm.runInNewContext(`(${app.fetchTranscript.toString()})("original-video")`, {
         URL,
+        AbortSignal,
         location: { href: "https://www.youtube.com/watch?v=original-video" },
         window: {},
+        ytcfg: { get: () => ({}) },
+        // The newer view's own request fails here, so the reader opens the panel instead.
+        async fetch() {
+          requests++;
+          throw new TypeError("Failed to fetch");
+        },
         performance: { now: () => clock },
         setTimeout(callback) { clock += 50; loaded = true; callback(); },
         document: {
@@ -1518,6 +1582,7 @@ for (const [format, panelLayout] of [
                 videoDetails: { videoId: "original-video", title: "Aliens talk" },
                 captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
               }),
+              getWatchNextResponse: () => format === "modern" ? modernWatchNext : {},
             };
             if (selector.startsWith("ytd-engagement-panel-section-list-renderer")) {
               const matchesPanel = selector.split(",").some((part) => panelLayout === "legacy"
@@ -1549,9 +1614,60 @@ for (const [format, panelLayout] of [
       assert.equal(styles[0].attached, false);
       // Reading stops polling once cues are present, so only a loading panel waits.
       assert.equal(clock, panelLayout === "combined-loading" ? 50 : 0);
+      assert.equal(requests, format === "modern" ? 1 : 0);
     });
   }
 }
+
+test("the newer transcript view is read by its own request, without opening the panel", async () => {
+  const app = popup();
+  const requests = [];
+  const segment = (timestamp, simpleText) => ({ macroMarkersPanelItemViewModel: { item: { timelineItemViewModel: {
+    contentItems: [{ transcriptSegmentViewModel: { timestamp, simpleText } }],
+  } } } });
+  const result = await vm.runInNewContext(`(${app.fetchTranscript.toString()})("original-video")`, {
+    URL,
+    AbortSignal,
+    location: { href: "https://www.youtube.com/watch?v=original-video" },
+    window: {},
+    ytcfg: { get: (key) => key === "INNERTUBE_CONTEXT" ? { client: { clientName: "WEB" } } : undefined },
+    async fetch(url, init) {
+      requests.push({ url, method: init.method, body: JSON.parse(init.body) });
+      return { json: async () => ({ content: { engagementPanelSectionListRenderer: { content: { sectionListRenderer: { contents: [
+        { itemSectionRenderer: { contents: [segment("0:02", "Where are\n  all the aliens?"), segment("2:14:07", "Closing topic")] } },
+        // A segment past the video's end is dropped, as the panel reader drops it.
+        { itemSectionRenderer: { contents: [segment("2:15:00", "After the end")] } },
+      ] } } } } }) };
+    },
+    document: {
+      createElement: () => ({ remove() {} }),
+      head: { append() { assert.fail("no panel opens, so none is hidden"); } },
+      querySelector(selector) {
+        if (selector === "#movie_player") return {
+          classList: { contains: () => false },
+          getDuration: () => 8049.781,
+          getPlayerResponse: () => ({
+            videoDetails: { videoId: "original-video", title: "Aliens talk" },
+            captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
+          }),
+          getWatchNextResponse: () => modernWatchNext,
+        };
+        // No transcript panel is open, and nothing is clicked.
+        return null;
+      },
+    },
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    cues: [{ time: 2, text: "Where are all the aliens?" }, { time: 8047, text: "Closing topic" }],
+    duration: 8049.781,
+    title: "Aliens talk",
+  });
+  assert.deepEqual(requests, [{
+    url: "/youtubei/v1/get_panel?prettyPrint=false",
+    method: "POST",
+    body: { context: { client: { clientName: "WEB" } }, panelId: "PAmodern_transcript_view", params: "modern-params" },
+  }]);
+});
 
 // Without the model on the device, titles come from code and the model is never touched.
 test("a device without the model renders code-named chapters through the production renderer", async () => {
