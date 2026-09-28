@@ -7,7 +7,7 @@ const vm = require("node:vm");
 const generated = {
   chapter1: { timestamp: 0, title: "  Generated opening  " },
   chapter2: { timestamp: 180, title: "Generated architecture" },
-  chapter3: { timestamp: 360, title: "Generated tradeoffs between battery life, comfort and weight" }, // 60 characters, the longest accepted title
+  chapter3: { timestamp: 360, title: "Generated tradeoffs of battery & comfort" }, // 40 characters, the longest label the schema allows
   chapter4: { timestamp: 540, title: "Generated conclusion" },
 };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -22,6 +22,7 @@ function popup(options = {}) {
   const inspections = [];
   const errors = [];
   const sessions = [];
+  const clones = [];
   const downloads = [];
   const creations = [];
   const createCalls = [];
@@ -101,16 +102,28 @@ function popup(options = {}) {
           assert.equal(type, "downloadprogress");
           downloads.push(listener);
         } });
-        // Code chooses the starts; the created session is prompted once for titles.
+        // Code chooses the starts; each batch of titles is asked in its own copy of the created session.
         const session = {
           destroyed: 0,
           signal: modelOptions.signal,
-          async prompt(text, promptOptions) {
+          async clone({ signal }) {
+            signal.throwIfAborted();
+            const copy = { ...this, destroyed: 0 };
+            clones.push(copy);
+            return copy;
+          },
+          // Like Chrome's stream, the answer arrives in chunks and ends with an error once its signal aborts.
+          async *promptStreaming(text, promptOptions) {
             prompts.push({ text, options: promptOptions });
-            if (options.promptReady) await options.promptReady;
+            const { signal } = promptOptions;
+            const aborted = new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+            aborted.catch(() => {});
+            if (options.promptReady) await Promise.race([options.promptReady, aborted]);
+            signal.throwIfAborted();
             if (options.titleError) throw options.titleError;
-            if (options.titleRaw !== undefined) return options.titleRaw;
-            return JSON.stringify(Object.fromEntries(promptOptions.responseConstraint.required.map(key => [key, generated[key].title])));
+            // A string arrives as one chunk; an array arrives chunk by chunk.
+            yield* [options.titleRaw ?? JSON.stringify(Object.fromEntries(promptOptions.responseConstraint.required.map(key =>
+              [key, generated[key]?.title ?? `Generated part ${key.slice(7)}`])))].flat();
           },
           destroy() { this.destroyed++; },
         };
@@ -185,7 +198,7 @@ function popup(options = {}) {
   assert.match(html, /<span id="label"[^>]*aria-live="polite"/);
 
   return {
-    button, label, again, offer, optIn, status, body, attributes, createCalls, calls, inspections, errors, sessions, prompts, timers, labels,
+    button, label, again, offer, optIn, status, body, attributes, createCalls, calls, inspections, errors, sessions, clones, prompts, timers, labels,
     ready: vm.runInContext("initialState", context),
     readChapterState: vm.runInContext("readChapterState", context),
     click: () => click(),
@@ -196,6 +209,8 @@ function popup(options = {}) {
     splitAtStarts: vm.runInContext("splitAtStarts", context),
     nameChapters: vm.runInContext("nameChapters", context),
     sectionCues: vm.runInContext("sectionCues", context),
+    tidyTitle: vm.runInContext("tidyTitle", context),
+    withKeywords: vm.runInContext("withKeywords", context),
     generateChapterData: vm.runInContext("generateChapterData", context),
     destroyed: () => sessions.reduce((total, session) => total + session.destroyed, 0),
     prompted: () => prompts.length,
@@ -209,10 +224,10 @@ function popup(options = {}) {
       timers.delete(entry[0]);
       await entry[1].callback();
     },
-    expireGeneration() {
+    // Fires the running title batch's deadline, the end of the click's budget.
+    expireTitles() {
       assert.equal(timers.size, 1);
       const [id, timer] = [...timers][0];
-      assert.equal(timer.delay, 60_000);
       timers.delete(id);
       now += timer.delay;
       timer.callback();
@@ -253,12 +268,13 @@ const harnessTranscript = {
   title: "Architecture talk",
 };
 
-// The chapters the code names when the model does not name them.
-function assertKeywordChapters(app) {
+// The chapters the code names when the model does not name them. `model` holds the titles the model did write, by
+// chapter; the other chapters keep their keyword titles.
+function assertKeywordChapters(app, model = []) {
   const chapters = JSON.parse(JSON.stringify(app.calls.at(-1).args[0]));
   assert.deepEqual(chapters.map(chapter => chapter.timestamp), [0, 180, 360, 540]);
   const named = app.nameChapters(app.sectionCues(harnessTranscript, [0, 180, 360, 540]), harnessTranscript.title);
-  assert.deepEqual(chapters.map(chapter => chapter.title), [...named]);
+  assert.deepEqual(chapters.map(chapter => chapter.title), named.map((title, index) => model[index] ?? title));
   assert.ok(chapters.every(chapter => chapter.title.length >= 3 && chapter.title.length <= 60));
 }
 
@@ -294,9 +310,9 @@ test("opening the popup on a video starts the model early and the click reuses i
   assert.equal(app.sessions.length, 1);
   assert.equal(app.prompted(), 1);
   assert.equal(app.sessions[0].destroyed, 1);
+  assert.equal(app.clones[0].destroyed, 1);
   // Generation's cleanup aborts the early session's controller too, after the session was used.
   assert.equal(app.sessions[0].signal.aborted, true);
-  assert.equal(app.prompts[0].options.signal.aborted, true);
 });
 
 test("closing the popup without a click destroys the early session", async () => {
@@ -358,7 +374,7 @@ test("an early session that fails to name chapters falls back to keyword titles"
   await app.ready;
   await tick();
   assert.equal(app.sessions.length, 1);
-  app.sessions[0].prompt = async () => { throw new Error("stale"); };
+  app.sessions[0].promptStreaming = async function* () { throw new Error("stale"); };
   await app.click();
   assert.equal(app.sessions.length, 1, "the failed session is not replaced by a second one");
   assertSuccess(app);
@@ -580,15 +596,17 @@ test("popup sends validated model output to the production renderer for the orig
   assert.deepEqual(JSON.parse(JSON.stringify(injection.args[0])), [
     { timestamp: 0, title: "Generated opening" },
     { timestamp: 180, title: "Generated architecture" },
-    { timestamp: 360, title: "Generated tradeoffs between battery life, comfort and weight" },
+    { timestamp: 360, title: "Generated tradeoffs of battery & comfort" },
     { timestamp: 540, title: "Generated conclusion" },
   ]);
   assertSuccess(app);
   assert.equal(app.errors.length, 0);
-  // The prompt carries the run's own signal; the early session's loading was cancelled with it.
-  assert.equal(app.prompts[0].options.signal.aborted, true);
+  // The titles came from a copy of the session, released after use; the early session's loading was cancelled with the run.
+  assert.equal(app.clones.length, 1);
+  assert.equal(app.clones[0].destroyed, 1);
   assert.equal(app.sessions[0].signal.aborted, true);
   assert.deepEqual([...app.prompts[0].options.responseConstraint.required], ["chapter1", "chapter2", "chapter3", "chapter4"]);
+  assert.equal(app.prompts[0].options.responseConstraint.properties.chapter1.maxLength, 40);
   assert.equal(app.prompts[0].options.omitResponseConstraintInput, true);
   assert.match(app.prompts[0].text, /The video is titled "Architecture talk"/);
   assert.equal(app.sessions[0].destroyed, 1);
@@ -680,7 +698,7 @@ test("a late model from a failed attempt cannot overwrite a successful retry", a
   assertSuccess(app);
 });
 
-test("a stalled prompt times out after 60 seconds and the chapters are named in code instead", async () => {
+test("a stalled batch ends 9 seconds after the click and its chapters keep their keyword titles", async () => {
   const prompt = deferred();
   const app = popup({ promptReady: prompt.promise });
   await app.ready;
@@ -688,11 +706,13 @@ test("a stalled prompt times out after 60 seconds and the chapters are named in 
   await tick();
   assert.equal(app.prompted(), 1);
   assert.equal(app.button.disabled, true);
-  app.expireGeneration();
+  assert.equal([...app.timers.values()][0].delay, 9_000);
+  app.expireTitles();
   await run;
   assertSuccess(app);
   assertKeywordChapters(app);
   assert.equal(app.prompts[0].options.signal.aborted, true);
+  assert.equal(app.clones[0].destroyed, 1);
   assert.equal(app.destroyed(), 1);
   assert.equal(app.calls.length, 2);
   prompt.resolve();
@@ -911,7 +931,7 @@ for (const [name, options] of [
   });
 }
 
-test("model startup and transcript setup do not consume the generation budget", async () => {
+test("model startup and transcript setup spend the click's title budget", async () => {
   const model = deferred();
   const transcript = deferred();
   const prompt = deferred();
@@ -919,7 +939,7 @@ test("model startup and transcript setup do not consume the generation budget", 
   await app.ready;
   const run = app.click();
   await tick();
-  app.advance(120_000);
+  app.advance(5_000);
   assert.equal(app.timers.size, 0);
   model.resolve();
   await tick();
@@ -927,7 +947,7 @@ test("model startup and transcript setup do not consume the generation budget", 
   transcript.resolve();
   await tick();
   assert.equal(app.prompted(), 1);
-  assert.equal([...app.timers.values()][0].delay, 60_000);
+  assert.equal([...app.timers.values()][0].delay, 4_000);
   prompt.resolve();
   await run;
   assertSuccess(app);
@@ -1036,27 +1056,61 @@ test("sparse captions give fewer chapters instead of invented starts", async () 
 });
 
 const generatedTitles = Object.fromEntries(Object.entries(generated).map(([key, chapter]) => [key, chapter.title]));
-for (const [name, options] of [
-  ["missing title key", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: undefined }) }],
-  ["extra title key", { titleRaw: JSON.stringify({ ...generatedTitles, chapter5: "Unexpected chapter" }) }],
-  ["wrong title type", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: 123 }) }],
-  ["blank title", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: "   " }) }],
-  ["oversized title", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: "x".repeat(61) }) }],
-  ["narrative outside JSON", { titleRaw: "Here are the chapters: " + JSON.stringify(generatedTitles) }],
-  ["a model failure", { titleError: new Error("Model failed") }],
+const modelTitles = Object.values(generatedTitles).map(title => title.trim());
+for (const [name, options, keyword] of [
+  ["missing title key", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: undefined }) }, [1]],
+  ["extra title key", { titleRaw: JSON.stringify({ ...generatedTitles, chapter5: "Unexpected chapter" }) }, []],
+  ["wrong title type", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: 123 }) }, [1]],
+  ["blank title", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: "   " }) }, [1]],
+  ["oversized title", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: "x".repeat(61) }) }, [1]],
+  ["narrative outside JSON", { titleRaw: "Here are the chapters: " + JSON.stringify(generatedTitles) }, []],
+  ["a model failure", { titleError: new Error("Model failed") }, [0, 1, 2, 3]],
 ]) {
-  // The model output is still rejected; the popup then names the chapters in code rather than failing.
-  test(`title step rejects ${name} and falls back to keyword titles`, async () => {
+  // Every usable title counts on its own; a chapter without one keeps its keyword title rather than failing the run.
+  test(`title step with ${name} keeps the usable model titles and keyword titles for the rest`, async () => {
     const app = popup(options);
     await app.ready;
     await app.click();
     assertSuccess(app);
-    assertKeywordChapters(app);
+    assertKeywordChapters(app, modelTitles.map((title, index) => keyword.includes(index) ? undefined : title));
     assert.equal(app.prompted(), 1);
     assert.equal(app.calls.length, 2);
     assert.equal(app.destroyed(), 1);
   });
 }
+
+test("a run of whitespace ends the batch and keeps the titles finished before it", async () => {
+  const app = popup({ titleRaw: [
+    `{"chapter1": "${modelTitles[0]}", "chapter2": "${modelTitles[1]}",`, "\n".repeat(12), "\n".repeat(12), '"chapter3": "Late title"}',
+  ] });
+  await app.ready;
+  await app.click();
+  assertSuccess(app);
+  // The 24th whitespace character in a row ends the stream, so the title after it is never read.
+  assertKeywordChapters(app, modelTitles.slice(0, 2));
+  assert.equal(app.prompts[0].options.signal.aborted, true);
+  assert.equal(app.clones[0].destroyed, 1);
+});
+
+test("titles are asked eight chapters at a time, each batch in its own copy of the session", async () => {
+  const transcriptResult = { duration: 2400, cues: Array.from({ length: 160 }, (_, index) => ({ time: index * 15, text: `Next, topic ${index}.` })), title: "Long talk" };
+  const app = popup({ transcriptResult });
+  await app.ready;
+  await app.click();
+  assertSuccess(app);
+  const starts = [...app.selectStarts(transcriptResult)];
+  assert.equal(starts.length, 14);
+  assert.deepEqual(app.prompts.map(prompt => prompt.options.responseConstraint.required.length), [8, 6]);
+  assert.match(app.prompts[0].text, new RegExp(`chapter8 contains ONLY ${starts[7]}-${starts[8]} seconds`));
+  assert.match(app.prompts[1].text, new RegExp(`chapter1 contains ONLY ${starts[8]}-`));
+  assert.deepEqual(app.clones.map(clone => clone.destroyed), [1, 1]);
+  assert.equal(app.destroyed(), 1);
+  // The second batch's chapter1 is the video's ninth chapter. Keyword phrases a model title lacks follow a colon.
+  const chapters = JSON.parse(JSON.stringify(app.calls[1].args[0]));
+  assert.deepEqual(chapters.map(chapter => chapter.timestamp), starts);
+  const batch = count => Array.from({ length: count }, (_, index) => modelTitles[index] ?? `Generated part ${index + 1}`);
+  assert.deepEqual(chapters.map(chapter => chapter.title.split(": ")[0]), [...batch(8), ...batch(6)]);
+});
 
 test("a single JSON fence is accepted without repairing title contents", async () => {
   const app = popup({ titleRaw: "```json\n" + JSON.stringify(generatedTitles) + "\n```" });
@@ -1066,30 +1120,23 @@ test("a single JSON fence is accepted without repairing title contents", async (
   assert.equal(app.calls[1].args[0][1].title, generated.chapter2.title);
 });
 
-for (const action of ["close", "timeout"]) {
-  test(`${action} during title generation destroys the session and ${action === "close" ? "renders nothing" : "names the chapters in code"}`, async () => {
-    const titles = deferred();
-    const app = popup({ promptReady: titles.promise });
-    await app.ready;
-    const run = app.click();
-    await tick();
-    assert.equal(app.prompted(), 1);
-    assert.equal(app.sessions.length, 1);
-    assert.equal(app.prompts[0].options.signal.aborted, false);
-    if (action === "timeout") {
-      app.expireGeneration();
-      await run;
-      assertSuccess(app);
-      assertKeywordChapters(app);
-    } else app.close();
-    titles.resolve();
-    await run;
-    // A closed popup renders nothing; a timeout has already rendered the code-named chapters.
-    assert.equal(app.calls.length, action === "close" ? 1 : 2);
-    assert.equal(app.destroyed(), 1);
-    assert.equal(app.timers.size, 0);
-  });
-}
+test("close during title generation destroys the session and renders nothing", async () => {
+  const titles = deferred();
+  const app = popup({ promptReady: titles.promise });
+  await app.ready;
+  const run = app.click();
+  await tick();
+  assert.equal(app.prompted(), 1);
+  assert.equal(app.sessions.length, 1);
+  assert.equal(app.prompts[0].options.signal.aborted, false);
+  app.close();
+  titles.resolve();
+  await run;
+  assert.equal(app.calls.length, 1);
+  assert.equal(app.clones[0].destroyed, 1);
+  assert.equal(app.destroyed(), 1);
+  assert.equal(app.timers.size, 0);
+});
 
 test("title sections contain their selected spans and exclude the next section", () => {
   const app = popup();
@@ -1103,30 +1150,34 @@ test("title sections contain their selected spans and exclude the next section",
   assert.match(prompt.split("chapter2 contains ONLY")[1], /Transition evidence[\s\S]*Closing evidence/);
 });
 
-test("dense transcripts keep the title prompt bounded", () => {
+test("dense transcripts keep a full batch's title prompt bounded", () => {
   const app = popup();
   const cues = Array.from({ length: 7200 }, (_, time) => ({ time, text: "Dense caption content ".repeat(100) }));
-  const starts = app.selectStarts({ duration: 7200, cues });
-  assert.equal(starts.length, 10);
-  assert.ok(app.buildTitlePrompt(cues, 7200, starts).length < 26_000);
+  const batch = Array.from({ length: 8 }, (_, index) => index * 900);
+  assert.ok(app.buildTitlePrompt(cues, 7200, batch).length < 11_000);
 });
 
-test("title sections keep their first three cues and sample the rest, twelve cues at most", () => {
+test("title sections show a short section whole and sample a long one evenly from its start to its end", () => {
   const app = popup();
   const cues = Array.from({ length: 40 }, (_, index) => ({ time: index * 5, text: `Cue ${index}` }));
-  const prompt = app.buildTitlePrompt(cues, 200, [0]);
-  const lines = prompt.split("chapter1 contains ONLY 0-200 seconds:\n")[1].split("\n");
-  // Cues 0-2 set up the topic; the remaining 37 are sampled every fifth cue.
-  assert.deepEqual(lines, [0, 1, 2, 3, 8, 13, 18, 23, 28, 33, 38].map(index => `${index * 5}s Cue ${index}`));
-  const short = app.buildTitlePrompt(cues.slice(0, 12), 60, [0]);
-  assert.equal(short.split("\n").filter(line => /^\d+s Cue/.test(line)).length, 12);
+  const lines = app.buildTitlePrompt(cues, 200, [0]).split("chapter1 contains ONLY 0-200 seconds:\n")[1].split("\n");
+  // A section that fits is shown whole, its captions joined in runs of about the same length.
+  const run = part => part.map(cue => cue.text).join(" ");
+  assert.deepEqual(lines, [`0s ${run(cues.slice(0, 21))}`, `105s ${run(cues.slice(21))}`]);
+  const long = Array.from({ length: 400 }, (_, index) => ({ time: index * 5, text: `Cue ${index} says a few more words about this part` }));
+  const times = app.buildTitlePrompt(long, 2000, [0]).split("seconds:\n")[1].split("\n").map(line => parseInt(line));
+  // A long section shows runs that start at about even steps, so its end reaches the model as often as its start.
+  assert.equal(times[0], 0);
+  assert.ok(times.at(-1) >= 1900, `${times}`);
+  assert.ok(times.slice(1).every((time, index) => Math.abs(time - times[index] - 2000 / times.length) <= 10), `${times}`);
 });
 
 test("chapter count follows duration and starts stay half an average chapter apart, with the first allowed from 60 s", () => {
   const app = popup();
   // Every caption announces a topic, so only duration and spacing limit the choice.
   const transcript = duration => ({ duration, cues: Array.from({ length: Math.ceil(duration / 15) }, (_, index) => ({ time: index * 15, text: `Next, topic ${index}.` })) });
-  for (const [duration, count] of [[100, 4], [600, 4], [1349, 7], [1350, 8], [7200, 10]]) {
+  // 3.86 x minutes^0.355 rounds from 8 to 9 at 555 s. At 2880 s it gives 15, but 16 chapters keep each within 180 s.
+  for (const [duration, count] of [[60, 4], [554, 8], [555, 9], [2880, 16], [3000, 16], [7200, 16]]) {
     const starts = app.selectStarts(transcript(duration));
     assert.equal(starts.length, count, `${duration}`);
     assert.equal(starts[0], 0);
@@ -1135,7 +1186,7 @@ test("chapter count follows duration and starts stay half an average chapter apa
       assert.ok(start - starts[index] >= (index ? gap : Math.min(gap, 60)) && start <= duration - gap, `${duration}: ${starts}`);
     });
     // Creators often end an intro at about a minute, so the first start may sit there on long videos.
-    if (duration === 600) assert.equal(starts[1], 60);
+    if (duration === 3000) assert.equal(starts[1], 60);
   }
 });
 
@@ -1146,7 +1197,10 @@ test("starts prefer announced topic changes over continuing captions", () => {
   for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."], [570, "Finally, the verdict."]]) {
     cues.find(cue => cue.time === time).text = text;
   }
-  assert.deepEqual([...app.selectStarts({ duration: 720, cues })], [0, 165, 390, 570]);
+  // Twelve minutes get nine chapters, so continuing captions fill the starts the announcements leave.
+  const starts = [...app.selectStarts({ duration: 720, cues })];
+  assert.equal(starts.length, 9);
+  assert.ok([165, 390, 570].every(time => starts.includes(time)), `${starts}`);
 });
 
 test("starts ignore captions that only look like announcements or questions", () => {
@@ -1165,11 +1219,15 @@ test("starts ignore captions that only look like announcements or questions", ()
 
 test("a speaker turn that opens with a real question starts a chapter", () => {
   const app = popup();
-  const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: "and the same part keeps going here" }));
-  for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."], [495, "- Did pricing change later?"], [570, "- What made you decide to leave"], [585, "the company after all those years?"]]) {
-    cues.find(cue => cue.time === time).text = text;
+  // The turn reuses the filler's words, so only its question, not new vocabulary, can make it a start.
+  for (const [end, asked] of [["?", true], [".", false]]) {
+    const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: "and the same part keeps going here" }));
+    for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."], [495, "- Did pricing change later?"], [570, "- Why does the same part keep going"], [585, `here after all this time${end}`]]) {
+      cues.find(cue => cue.time === time).text = text;
+    }
+    const starts = [...app.selectStarts({ duration: 720, cues })];
+    assert.ok(starts.includes(570) === asked && !starts.includes(495), `${end}: ${starts}`);
   }
-  assert.deepEqual([...app.selectStarts({ duration: 720, cues })], [0, 165, 390, 570]);
 });
 
 test("a section marker inside a long caption starts a chapter at its own sentence", () => {
@@ -1181,7 +1239,7 @@ test("a section marker inside a long caption starts a chapter at its own sentenc
   // Auto-generated captions hold several sentences; "Part three." sits 30 of 60 characters into a 15-second caption.
   cues.find(cue => cue.time === 555).text = "the same part keeps going. Part three. The verdict here.";
   const starts = [...app.selectStarts({ duration: 720, cues })];
-  assert.deepEqual(starts, [0, 165, 390, 562]);
+  assert.ok([165, 390, 562].every(time => starts.includes(time)) && !starts.includes(555), `${starts}`);
   const sections = app.splitAtStarts(cues, 720, starts).filter(cue => cue.time >= 555 && cue.time < 570);
   assert.deepEqual(sections.map(cue => [cue.time, cue.text]), [[555, "the same part keeps going."], [562, "Part three. The verdict here."]]);
 });
@@ -1207,7 +1265,8 @@ test("in unpunctuated captions a section word or topic turn starts a chapter at 
   cues.find(cue => cue.time === 168).text = "number two is the battery test";
   cues.find(cue => cue.time === 390).text = "so speaking of the camera lens";
   cues.find(cue => cue.time === 570).text = "my final point is the verdict";
-  assert.deepEqual([...app.selectStarts({ duration: 720, cues })], [0, 167, 390, 570]);
+  const starts = [...app.selectStarts({ duration: 720, cues })];
+  assert.ok([167, 390, 570].every(time => starts.includes(time)) && !starts.includes(165) && !starts.includes(168), `${starts}`);
 });
 
 test("in unpunctuated captions an opener at a line start does not announce", () => {
@@ -1230,7 +1289,8 @@ test("a topic turn inside a punctuated caption starts a chapter at its own word"
   }
   // "speaking of" begins 20 of 55 characters into a 15-second caption, mid-sentence.
   cues.find(cue => cue.time === 555).text = "It keeps going, and speaking of the verdict, it's good.";
-  assert.deepEqual([...app.selectStarts({ duration: 720, cues })], [0, 165, 390, 560]);
+  const starts = [...app.selectStarts({ duration: 720, cues })];
+  assert.ok([165, 390, 560].every(time => starts.includes(time)) && !starts.includes(555), `${starts}`);
 });
 
 test("a caption of only sounds never becomes a start", () => {
@@ -1270,22 +1330,24 @@ test("captions without an inner section marker keep their title sections", () =>
   assert.deepEqual(app.splitAtStarts(cues, 100, [0, 50]), cues);
 });
 
-test("no chapter runs longer than two average chapters", () => {
+test("no chapter runs longer than 180 s where sixteen chapters allow it", () => {
   const app = popup();
   const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: "and the same part keeps going here" }));
   for (const [time, text] of [[105, "Next, the battery."], [210, "Moving on to the camera."], [315, "Finally, the verdict."]]) {
     cues.find(cue => cue.time === time).text = text;
   }
   const edges = [...app.selectStarts({ duration: 720, cues }), 720];
-  assert.equal(edges.length, 5);
-  assert.ok(edges.slice(1).every((edge, index) => edge - edges[index] <= 360), `${edges}`);
+  assert.equal(edges.length, 10);
+  // The last chapter is held to the limit only up to its last caption, then runs on to the video's end.
+  assert.ok(edges.slice(1, -1).every((edge, index) => edge - edges[index] <= 180), `${edges}`);
 });
 
 test("sparse captions never invent starts", () => {
   const app = popup();
   assert.deepEqual([...app.selectStarts({ duration: 720, cues: [{ time: 0, text: "Only opening words" }] })], [0]);
-  // Captions only in the first minute of a 12-minute video leave no candidate half an average chapter from the start.
-  const early = Array.from({ length: 12 }, (_, index) => ({ time: index * 5, text: `Next, part ${index}.` }));
+  // Captions only in the first half minute of a 12-minute video leave no candidate half an average chapter (40 s) from
+  // the start.
+  const early = Array.from({ length: 6 }, (_, index) => ({ time: index * 5, text: `Next, part ${index}.` }));
   assert.deepEqual([...app.selectStarts({ duration: 720, cues: early })], [0]);
 });
 
@@ -1295,7 +1357,8 @@ test("title prompt uses the video title only as naming context", () => {
   assert.match(app.buildTitlePrompt(cues, 100, [0, 50], "Headset \"review\""), /The video is titled "Headset \\"review\\""; use that only to identify its product or subject/);
   const untitled = app.buildTitlePrompt(cues, 100, [0, 50]);
   assert.doesNotMatch(untitled, /video is titled/);
-  assert.match(untitled, /3-7 words and at most 60 characters/);
+  assert.match(untitled, /short label of 2 to 5 words/);
+  assert.match(untitled, /Labels are at most 40 characters/);
 });
 
 for (const [format, panelLayout] of [
@@ -1460,7 +1523,8 @@ test("an announced topic names its section and a repeated word ends the phrase",
     [60, 200, ["let's talk about price the price of a premium tent is high", "price matters and the price ranges vary", "cheap tents leak"]],
     [200, 300, ["now for the season rating", "a three season tent", "the season rating tells you", "season matters"]],
   ), "How To Choose A Tent");
-  assert.deepEqual(titles, ["Intro", "Price", "Season Rating"]);
+  // A thin first section that says a phrase of the video's title is an overview of that subject.
+  assert.deepEqual(titles, ["Tents Overview", "Price", "Season Rating"]);
 });
 
 test("numbered section words become labels with the announced phrase", () => {
@@ -1470,7 +1534,8 @@ test("numbered section words become labels with the announced phrase", () => {
     [60, 200, ["mistake five wrong strength line.", "the strength line breaks", "use a strong line", "strength line again"]],
     [200, 300, ["mistake seven bad hooks.", "hooks rust", "sharp hooks matter", "hooks again"]],
   ), "Fishing Mistakes");
-  assert.deepEqual(titles, ["Intro", "Mistake 5: Wrong Strength Line", "Mistake 7: Bad Hooks"]);
+  // A first section of a minute is named by what it says, not Intro.
+  assert.deepEqual(titles, ["Intro Words", "Mistake 5: Wrong Strength Line", "Mistake 7: Bad Hooks"]);
 });
 
 test("a repeated collocation beats its single words without an announcement", () => {
@@ -1480,6 +1545,17 @@ test("a repeated collocation beats its single words without an announcement", ()
     [200, 400, ["the rinse aid dispenser", "rinse aid stops spots", "fill the rinse aid", "rinse aid is cheap"]],
   ), "Dishwasher Tips");
   assert.deepEqual(titles, ["Heating Element", "Rinse Aid"]);
+});
+
+test("a section that repeats three strong phrases names all three, and one with a single phrase keeps it alone", () => {
+  const app = popup();
+  const titles = app.nameChapters(sections(
+    [0, 200, ["the heating element warms the water", "a heating element can fail", "check the heating element", "the rinse aid dispenser",
+      "rinse aid stops spots", "fill the rinse aid", "the spray arm spins", "clean the spray arm", "a clogged spray arm"]],
+    [200, 400, ["the door seal keeps water in", "a worn door seal leaks", "replace the door seal", "door seal again"]],
+  ), "Dishwasher Tips");
+  assert.deepEqual(titles, ["Heating Element, Rinse Aid & Spray Arm", "Door Seal"]);
+  assert.ok(titles[0].length <= 60);
 });
 
 test("short thin edge sections read Intro and Outro, and wordless sections never throw", () => {
@@ -1499,4 +1575,17 @@ test("short thin edge sections read Intro and Outro, and wordless sections never
     assert.equal(titles.length, odd.length);
     assert.ok(titles.every(title => typeof title === "string" && title.length >= 3 && title.length <= 60), JSON.stringify(titles));
   }
+});
+
+test("a model title cut by the length limit loses its open bracket and trailing separators", () => {
+  const app = popup();
+  assert.equal(app.tidyTitle("Battery Life (Screen On"), "Battery Life");
+  assert.equal(app.tidyTitle("Camera, Battery &"), "Camera, Battery");
+  assert.equal(app.tidyTitle("Camera, Battery & Price"), "Camera, Battery & Price");
+});
+
+test("a model title takes only the keyword phrases it lacks, within 60 characters", () => {
+  const app = popup();
+  assert.equal(app.withKeywords("Battery Life", "Battery Life, Fast Charging & USB-C Cable"), "Battery Life: Fast Charging, USB-C Cable");
+  assert.equal(app.withKeywords("Battery Life and Charging Speed Test", "Wireless Charging Pads & Power Delivery Standards"), "Battery Life and Charging Speed Test");
 });
