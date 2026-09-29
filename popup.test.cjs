@@ -16,7 +16,9 @@ const tick = async () => {
 };
 function deferred() {
   let resolve;
-  const promise = new Promise((done) => { resolve = done; });
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
   return { promise, resolve };
 }
 const source = (file) => readFileSync(path.join(__dirname, file), "utf8");
@@ -35,10 +37,15 @@ function popup(options = {}) {
   const timers = new Map();
   let timerId = 0;
   let now = 1_000;
-  class Clock extends Date { static now() { return now; } }
-  const tab = options.tab === undefined
-    ? { id: 42, url: "https://www.youtube.com/watch?v=original-video" }
-    : options.tab;
+  class Clock extends Date {
+    static now() {
+      return now;
+    }
+  }
+  const tab =
+    options.tab === undefined
+      ? { id: 42, url: "https://www.youtube.com/watch?v=original-video" }
+      : options.tab;
   const globals = {
     URL,
     AbortController,
@@ -47,65 +54,95 @@ function popup(options = {}) {
       timers.set(++timerId, { callback, delay });
       return timerId;
     },
-    clearTimeout(id) { timers.delete(id); },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
     console: { error: (error) => errors.push(error) },
-    ...(options.missingApi ? {} : { LanguageModel: {
-      availability: async () => {
-        if (options.availabilityReady) await options.availabilityReady;
-        reads.push("availability");
-        // A model that goes away after the popup's read.
-        return (reads.length > 1 && options.availabilityAfter) || options.availability || "available";
-      },
-      create(modelOptions) {
-        createCalls.push(modelOptions);
-        modelOptions.monitor?.({ addEventListener: (type, listener) => {
-          assert.equal(type, "downloadprogress");
-          downloads.push(listener);
-        } });
-        // Code chooses the starts; each batch of titles is asked in its own copy of the created session.
-        const session = {
-          destroyed: 0,
-          signal: modelOptions.signal,
-          async clone({ signal }) {
-            signal.throwIfAborted();
-            const copy = { ...this, destroyed: 0 };
-            clones.push(copy);
-            return copy;
+    ...(options.missingApi
+      ? {}
+      : {
+          LanguageModel: {
+            availability: async () => {
+              if (options.availabilityReady) await options.availabilityReady;
+              reads.push("availability");
+              if (options.availabilityError) throw options.availabilityError;
+              // A model that goes away after the popup's read.
+              return (
+                (reads.length > 1 && options.availabilityAfter) ||
+                options.availability ||
+                "available"
+              );
+            },
+            create(modelOptions) {
+              createCalls.push(modelOptions);
+              modelOptions.monitor?.({
+                addEventListener: (type, listener) => {
+                  assert.equal(type, "downloadprogress");
+                  downloads.push(listener);
+                },
+              });
+              // Code chooses the starts; each batch of titles is asked in its own copy of the created session.
+              const session = {
+                destroyed: 0,
+                signal: modelOptions.signal,
+                async clone({ signal }) {
+                  signal.throwIfAborted();
+                  const copy = { ...this, destroyed: 0 };
+                  clones.push(copy);
+                  return copy;
+                },
+                // Like Chrome's stream, the answer arrives in chunks and ends with an error once its signal aborts.
+                async *promptStreaming(text, promptOptions) {
+                  prompts.push({ text, options: promptOptions });
+                  const { signal } = promptOptions;
+                  const aborted = new Promise((_, reject) =>
+                    signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+                  );
+                  aborted.catch(() => {});
+                  if (options.promptReady) await Promise.race([options.promptReady, aborted]);
+                  signal.throwIfAborted();
+                  if (options.titleError) throw options.titleError;
+                  // A string arrives as one chunk; an array arrives chunk by chunk.
+                  yield* [
+                    options.titleRaw ??
+                      JSON.stringify(
+                        Object.fromEntries(
+                          promptOptions.responseConstraint.required.map((key) => [
+                            key,
+                            generated[key]?.title ?? `Generated part ${key.slice(7)}`,
+                          ]),
+                        ),
+                      ),
+                  ].flat();
+                },
+                destroy() {
+                  this.destroyed++;
+                },
+              };
+              // A create Chrome refuses: no space for the download, or a model that went away.
+              if (options.createError) {
+                const failure = Promise.resolve(options.modelReady).then(() => {
+                  throw options.createError;
+                });
+                creations.push(failure);
+                return failure;
+              }
+              sessions.push(session);
+              const creation = options.modelReady
+                ? options.modelReady.then(() => session)
+                : Promise.resolve(session);
+              creations.push(creation);
+              return creation;
+            },
           },
-          // Like Chrome's stream, the answer arrives in chunks and ends with an error once its signal aborts.
-          async *promptStreaming(text, promptOptions) {
-            prompts.push({ text, options: promptOptions });
-            const { signal } = promptOptions;
-            const aborted = new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
-            aborted.catch(() => {});
-            if (options.promptReady) await Promise.race([options.promptReady, aborted]);
-            signal.throwIfAborted();
-            if (options.titleError) throw options.titleError;
-            // A string arrives as one chunk; an array arrives chunk by chunk.
-            yield* [options.titleRaw ?? JSON.stringify(Object.fromEntries(promptOptions.responseConstraint.required.map(key =>
-              [key, generated[key]?.title ?? `Generated part ${key.slice(7)}`])))].flat();
-          },
-          destroy() { this.destroyed++; },
-        };
-        // A create Chrome refuses: no space for the download, or a model that went away.
-        if (options.createError) {
-          const failure = Promise.resolve(options.modelReady).then(() => { throw options.createError; });
-          creations.push(failure);
-          return failure;
-        }
-        sessions.push(session);
-        const creation = options.modelReady
-          ? options.modelReady.then(() => session)
-          : Promise.resolve(session);
-        creations.push(creation);
-        return creation;
-      },
-    } }),
+        }),
   };
-  const tabs = { query: async () => {
-    if (options.tabReady) await options.tabReady;
-    return tab ? [tab] : [];
-  } };
+  const tabs = {
+    query: async () => {
+      if (options.tabReady) await options.tabReady;
+      return tab ? [tab] : [];
+    },
+  };
   const scripting = {
     async executeScript(injection) {
       if (injection.func.name === "readChapterState") {
@@ -118,21 +155,27 @@ function popup(options = {}) {
       if (injection.func.name === "fetchTranscript") {
         if (options.transcriptReady) await options.transcriptReady;
         if (options.transcriptError) throw options.transcriptError;
-        if (options.transcriptResultError) return [{ result: { error: options.transcriptResultError } }];
-        if (Object.hasOwn(options, "transcriptResult")) return [{ result: options.transcriptResult }];
+        if (options.transcriptResultError)
+          return [{ result: { error: options.transcriptResultError } }];
+        if (Object.hasOwn(options, "transcriptResult"))
+          return [{ result: options.transcriptResult }];
         // A later tab URL must not replace the identity captured on click.
         tab.url = "https://www.youtube.com/watch?v=different-video";
-        return [{ result: {
-          duration: 720,
-          // Announced topics at 180, 360 and 540 become the generated starts.
-          cues: [
-            { time: 0, text: "Transcript about architecture." },
-            { time: 180, text: "Next, the architecture itself." },
-            { time: 360, text: "Next, tradeoffs between battery life and comfort." },
-            { time: 540, text: "Next, the conclusion." },
-          ],
-          title: "Architecture talk",
-        } }];
+        return [
+          {
+            result: {
+              duration: 720,
+              // Announced topics at 180, 360 and 540 become the generated starts.
+              cues: [
+                { time: 0, text: "Transcript about architecture." },
+                { time: 180, text: "Next, the architecture itself." },
+                { time: 360, text: "Next, tradeoffs between battery life and comfort." },
+                { time: 540, text: "Next, the conclusion." },
+              ],
+              title: "Architecture talk",
+            },
+          },
+        ];
       }
       // A reloaded tab's chapters are drawn from what the page kept, so the worker sends none.
       if (injection.args[0] === null) return [{ result: options.restoreResults.shift() }];
@@ -153,13 +196,17 @@ function popup(options = {}) {
       runtime: { onConnect: { addListener: (listener) => onConnect.push(listener) } },
       tabs: { onUpdated: { addListener: (listener) => onUpdated.push(listener) } },
     },
-    importScripts: (...files) => files.forEach((file) => vm.runInContext(source(file), worker, { filename: file })),
+    importScripts: (...files) =>
+      files.forEach((file) => vm.runInContext(source(file), worker, { filename: file })),
   });
   vm.runInContext(source("background.js"), worker, { filename: "background.js" });
 
   // A connection whose ends each hear the other's messages and closing a task later, as in Chrome.
   function connect() {
-    const ends = [{ message: [], disconnect: [] }, { message: [], disconnect: [] }];
+    const ends = [
+      { message: [], disconnect: [] },
+      { message: [], disconnect: [] },
+    ];
     let connected = true;
     const end = (own, other) => ({
       onMessage: { addListener: (listener) => ends[own].message.push(listener) },
@@ -167,7 +214,9 @@ function popup(options = {}) {
       postMessage(message) {
         if (!connected) throw new Error("Attempting to use a disconnected port object");
         const copy = JSON.parse(JSON.stringify(message));
-        setImmediate(() => { if (connected) ends[other].message.forEach((listener) => listener(copy)); });
+        setImmediate(() => {
+          if (connected) ends[other].message.forEach((listener) => listener(copy));
+        });
       },
       disconnect() {
         if (!connected) return;
@@ -197,12 +246,18 @@ function popup(options = {}) {
         assert.equal(event, "click");
         click = listener;
       },
-      setAttribute(name, value) { attributes[name] = value; },
-      removeAttribute(name) { delete attributes[name]; },
+      setAttribute(name, value) {
+        attributes[name] = value;
+      },
+      removeAttribute(name) {
+        delete attributes[name];
+      },
     };
     // The button's words live in their own span, beside the circular arrow that offers another naming.
     const label = {
-      get textContent() { return labels.at(-1); },
+      get textContent() {
+        return labels.at(-1);
+      },
       set textContent(value) {
         if (value !== labels.at(-1)) labels.push(value);
       },
@@ -210,15 +265,25 @@ function popup(options = {}) {
     // The arrow is an SVG element: no hidden property, only the attribute.
     const again = {
       attributes: new Set(["hidden"]),
-      hasAttribute(name) { return this.attributes.has(name); },
+      hasAttribute(name) {
+        return this.attributes.has(name);
+      },
       toggleAttribute(name, force) {
-        if (force) this.attributes.add(name); else this.attributes.delete(name);
+        if (force) this.attributes.add(name);
+        else this.attributes.delete(name);
         return force;
       },
     };
     const offer = { hidden: true };
     const optIn = { checked: false };
-    const elements = { "#create": button, "#label": label, "#again": again, "#status": status, "#offer": offer, "#opt-in": optIn };
+    const elements = {
+      "#create": button,
+      "#label": label,
+      "#again": again,
+      "#status": status,
+      "#offer": offer,
+      "#opt-in": optIn,
+    };
     const queried = new Set();
     const context = vm.createContext({
       ...globals,
@@ -243,12 +308,21 @@ function popup(options = {}) {
     // of them: a renamed id would otherwise break the popup without breaking a test.
     const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
     assert.deepEqual([...queried].sort(), Object.keys(elements).sort());
-    for (const selector of queried) assert.ok(ids.has(selector.slice(1)), `${selector} is missing from popup.html`);
+    for (const selector of queried)
+      assert.ok(ids.has(selector.slice(1)), `${selector} is missing from popup.html`);
     // The button's words change under the pointer, so a screen reader is told when they do.
     assert.match(html, /<span id="label"[^>]*aria-live="polite"/);
 
     return {
-      button, label, again, offer, optIn, status, body, attributes, labels,
+      button,
+      label,
+      again,
+      offer,
+      optIn,
+      status,
+      body,
+      attributes,
+      labels,
       ready: vm.runInContext("initialState", context),
       readChapterState: vm.runInContext("readChapterState", context),
       click: () => click(),
@@ -262,7 +336,14 @@ function popup(options = {}) {
 
   return {
     ...open(),
-    createCalls, calls, inspections, errors, sessions, clones, prompts, timers,
+    createCalls,
+    calls,
+    inspections,
+    errors,
+    sessions,
+    clones,
+    prompts,
+    timers,
     // Another popup on the same tab, beside the same worker.
     reopen: open,
     // Chrome stops the worker, which closes its connections.
@@ -283,7 +364,9 @@ function popup(options = {}) {
     prompted: () => prompts.length,
     modelCreated: (index = 0) => creations[index],
     reportProgress: (loaded, index = 0) => downloads[index]({ loaded }),
-    advance: (milliseconds) => { now += milliseconds; },
+    advance: (milliseconds) => {
+      now += milliseconds;
+    },
     async checkAd() {
       const entry = [...timers].find(([, timer]) => timer.delay === 750);
       assert.ok(entry, "ad state schedules a recheck");
@@ -338,10 +421,19 @@ const harnessTranscript = {
 // chapter; the other chapters keep their keyword titles.
 function assertKeywordChapters(app, model = []) {
   const chapters = JSON.parse(JSON.stringify(app.calls.at(-1).args[0]));
-  assert.deepEqual(chapters.map(chapter => chapter.timestamp), [0, 180, 360, 540]);
-  const named = app.nameChapters(app.sectionCues(harnessTranscript, [0, 180, 360, 540]), harnessTranscript.title);
-  assert.deepEqual(chapters.map(chapter => chapter.title), named.map((title, index) => model[index] ?? title));
-  assert.ok(chapters.every(chapter => chapter.title.length >= 3 && chapter.title.length <= 60));
+  assert.deepEqual(
+    chapters.map((chapter) => chapter.timestamp),
+    [0, 180, 360, 540],
+  );
+  const named = app.nameChapters(
+    app.sectionCues(harnessTranscript, [0, 180, 360, 540]),
+    harnessTranscript.title,
+  );
+  assert.deepEqual(
+    chapters.map((chapter) => chapter.title),
+    named.map((title, index) => model[index] ?? title),
+  );
+  assert.ok(chapters.every((chapter) => chapter.title.length >= 3 && chapter.title.length <= 60));
 }
 
 for (const [chapterState, message] of [
@@ -428,7 +520,7 @@ test("a popup opened during a run shows it working, follows it to the end and st
   await watching.ready;
   assert.equal(watching.body.dataset.state, "working");
   assert.equal(watching.button.disabled, true);
-  assert.equal(watching.label.textContent, "Generating chapters...");
+  assert.equal(watching.label.textContent, "Generating chapters");
   // A click before the popup has read the tab joins the run too.
   const clicking = app.reopen();
   clicking.click();
@@ -471,7 +563,10 @@ test("a reloaded tab draws its kept chapters again once YouTube has built the pl
   retry.callback();
   await tick();
   assert.equal(restores().length, 2);
-  assert.ok(![...app.timers.values()].some((timer) => timer.delay === 500), "drawn chapters end the retries");
+  assert.ok(
+    ![...app.timers.values()].some((timer) => timer.delay === 500),
+    "drawn chapters end the retries",
+  );
 });
 
 test("a worker that stops mid-run ends the popup's run with the general error", async () => {
@@ -519,7 +614,9 @@ test("an early session that fails to name chapters falls back to keyword titles"
   await app.ready;
   await tick();
   assert.equal(app.sessions.length, 1);
-  app.sessions[0].promptStreaming = async function* () { throw new Error("stale"); };
+  app.sessions[0].promptStreaming = async function* () {
+    throw new Error("stale");
+  };
   await app.click();
   assert.equal(app.sessions.length, 1, "the failed session is not replaced by a second one");
   assertSuccess(app);
@@ -530,10 +627,14 @@ test("an early session that fails to name chapters falls back to keyword titles"
 test("late chapter inspection cannot replace generation or its result", async () => {
   const inspection = deferred();
   const prompt = deferred();
-  const app = popup({ inspectionReady: inspection.promise, promptReady: prompt.promise, chapterState: { native: true } });
+  const app = popup({
+    inspectionReady: inspection.promise,
+    promptReady: prompt.promise,
+    chapterState: { native: true },
+  });
   const run = app.click();
   assert.equal(app.button.disabled, true);
-  assert.equal(app.label.textContent, "Generating chapters...");
+  assert.equal(app.label.textContent, "Generating chapters");
   assert.equal(app.status.textContent, "");
   await tick();
   prompt.resolve();
@@ -544,7 +645,9 @@ test("late chapter inspection cannot replace generation or its result", async ()
 });
 
 test("chapter inspection failures show concise feedback and allow retry", async () => {
-  const app = popup({ inspectionError: new Error("Cannot access contents of the page. Long browser explanation.") });
+  const app = popup({
+    inspectionError: new Error("Cannot access contents of the page. Long browser explanation."),
+  });
   await app.ready;
   assertRetry(app, /Can't access this video/);
   await app.click();
@@ -555,51 +658,119 @@ test("chapter detection requires structured chapters for the current video", () 
   const app = popup();
   const chapters = [
     { chapterRenderer: { title: { simpleText: "Introduction" }, timeRangeStartMillis: 0 } },
-    { chapterRenderer: { title: { runs: [{ text: "Main " }, { text: "topic" }] }, timeRangeStartMillis: 65000 } },
+    {
+      chapterRenderer: {
+        title: { runs: [{ text: "Main " }, { text: "topic" }] },
+        timeRangeStartMillis: 65000,
+      },
+    },
   ];
   const watchNext = (markersMap, videoId = "original-video") => ({
     currentVideoEndpoint: { watchEndpoint: { videoId } },
-    playerOverlays: { playerOverlayRenderer: { decoratedPlayerBarRenderer: {
-      decoratedPlayerBarRenderer: { playerBar: { multiMarkersPlayerBarRenderer: { markersMap } } },
-    } } },
+    playerOverlays: {
+      playerOverlayRenderer: {
+        decoratedPlayerBarRenderer: {
+          decoratedPlayerBarRenderer: {
+            playerBar: { multiMarkersPlayerBarRenderer: { markersMap } },
+          },
+        },
+      },
+    },
   });
-  const markers = (value = chapters, key = "DESCRIPTION_CHAPTERS") => [{ key, value: { chapters: value } }];
-  const detect = ({ next = watchNext(markers()), playerId = "original-video", videoId = "original-video",
-    title = "In this video", drawn = false } = {}) => vm.runInNewContext(
-    `(${app.readChapterState.toString()})("original-video")`, {
-      URL, location: { href: `https://www.youtube.com/watch?v=${videoId}` },
+  const markers = (value = chapters, key = "DESCRIPTION_CHAPTERS") => [
+    { key, value: { chapters: value } },
+  ];
+  const detect = ({
+    next = watchNext(markers()),
+    playerId = "original-video",
+    videoId = "original-video",
+    title = "In this video",
+    drawn = false,
+  } = {}) =>
+    vm.runInNewContext(`(${app.readChapterState.toString()})("original-video")`, {
+      URL,
+      location: { href: `https://www.youtube.com/watch?v=${videoId}` },
       // Chapters this extension drew leave their cleanup on the page.
       window: drawn ? { __nanoChaptersCleanup() {} } : {},
       document: {
-        querySelector: (selector) => selector === "#movie_player" ? {
-          getPlayerResponse: () => ({ videoDetails: { videoId: playerId }, captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } } }),
-          ...(next === null ? {} : { getWatchNextResponse: () => next }),
-        } : null,
+        querySelector: (selector) =>
+          selector === "#movie_player"
+            ? {
+                getPlayerResponse: () => ({
+                  videoDetails: { videoId: playerId },
+                  captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
+                }),
+                ...(next === null ? {} : { getWatchNextResponse: () => next }),
+              }
+            : null,
         querySelectorAll: () => [{ textContent: title, closest: () => ({ disabled: false }) }],
       },
     });
 
-  assert.equal(detect({ next: watchNext(undefined) }).native, false, "Timeline-only video is not chaptered");
-  assert.equal(detect({ title: "" }).native, true, "chapters do not depend on a visible player title");
+  assert.equal(
+    detect({ next: watchNext(undefined) }).native,
+    false,
+    "Timeline-only video is not chaptered",
+  );
+  assert.equal(
+    detect({ title: "" }).native,
+    true,
+    "chapters do not depend on a visible player title",
+  );
   assert.equal(detect({ next: watchNext(markers(chapters, "AUTO_CHAPTERS")) }).native, true);
   // Chapters this extension drew are reported apart from the video's own.
-  assert.deepEqual(JSON.parse(JSON.stringify(detect())), { native: true, blocked: "", transcript: true, added: false });
+  assert.deepEqual(JSON.parse(JSON.stringify(detect())), {
+    native: true,
+    blocked: "",
+    transcript: true,
+    added: false,
+  });
   assert.equal(detect({ drawn: true }).added, true);
-  assert.equal(detect({ next: watchNext(markers(), "previous-video") }).native, false, "stale watch data");
+  assert.equal(
+    detect({ next: watchNext(markers(), "previous-video") }).native,
+    false,
+    "stale watch data",
+  );
   assert.equal(detect({ playerId: "previous-video" }).native, false, "stale player data");
   assert.equal(detect({ videoId: "different-video" }), null);
 
-  for (const next of [null, {}, watchNext({}), watchNext([null]), watchNext([{ key: "HEATSEEKER", value: { heatmap: {} } }])]) {
-    assert.equal(detect({ next }).native, false, "missing or unrelated metadata is not chapter evidence");
+  for (const next of [
+    null,
+    {},
+    watchNext({}),
+    watchNext([null]),
+    watchNext([{ key: "HEATSEEKER", value: { heatmap: {} } }]),
+  ]) {
+    assert.equal(
+      detect({ next }).native,
+      false,
+      "missing or unrelated metadata is not chapter evidence",
+    );
   }
-  for (const invalid of [undefined, {}, [], chapters.slice(0, 1), [null, null],
-    chapters.toReversed(), [chapters[0], chapters[0]],
+  for (const invalid of [
+    undefined,
+    {},
+    [],
+    chapters.slice(0, 1),
+    [null, null],
+    chapters.toReversed(),
+    [chapters[0], chapters[0]],
     [chapters[0], { chapterRenderer: { title: { simpleText: " " }, timeRangeStartMillis: 65000 } }],
     [chapters[0], { chapterRenderer: { title: { runs: {} }, timeRangeStartMillis: 65000 } }],
-    [chapters[0], { chapterRenderer: { title: { simpleText: "Topic" }, timeRangeStartMillis: "65000" } }],
-    [chapters[0], { chapterRenderer: { title: { simpleText: "Topic" }, timeRangeStartMillis: NaN } }],
+    [
+      chapters[0],
+      { chapterRenderer: { title: { simpleText: "Topic" }, timeRangeStartMillis: "65000" } },
+    ],
+    [
+      chapters[0],
+      { chapterRenderer: { title: { simpleText: "Topic" }, timeRangeStartMillis: NaN } },
+    ],
   ]) {
-    assert.equal(detect({ next: watchNext([{ value: { chapters: invalid } }]) }).native, false, "invalid chapter list");
+    assert.equal(
+      detect({ next: watchNext([{ value: { chapters: invalid } }]) }).native,
+      false,
+      "invalid chapter list",
+    );
   }
 });
 
@@ -724,15 +895,25 @@ test("closing the popup stops pending and in-flight ad rechecks", async () => {
 
 test("the production detector distinguishes ad duration from a short loaded video", () => {
   const app = popup();
-  const detect = (ad, duration, videoId = "original-video", captions = { playerCaptionsTracklistRenderer: { captionTracks: [{}] } }) => vm.runInNewContext(
-    `(${app.readChapterState.toString()})("original-video")`, {
-      URL, location: { href: "https://www.youtube.com/watch?v=original-video" }, window: {},
+  const detect = (
+    ad,
+    duration,
+    videoId = "original-video",
+    captions = { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
+  ) =>
+    vm.runInNewContext(`(${app.readChapterState.toString()})("original-video")`, {
+      URL,
+      location: { href: "https://www.youtube.com/watch?v=original-video" },
+      window: {},
       document: {
-        querySelector: (selector) => selector === "#movie_player" ? {
-          classList: { contains: () => ad },
-          getDuration: () => duration,
-          getPlayerResponse: () => ({ videoDetails: { videoId }, captions }),
-        } : null,
+        querySelector: (selector) =>
+          selector === "#movie_player"
+            ? {
+                classList: { contains: () => ad },
+                getDuration: () => duration,
+                getPlayerResponse: () => ({ videoDetails: { videoId }, captions }),
+              }
+            : null,
         querySelectorAll: () => [],
       },
     });
@@ -744,7 +925,11 @@ test("the production detector distinguishes ad duration from a short loaded vide
   // Only the player's data for this video can say it has no captions; a player still on another video blocks nothing.
   assert.equal(detect(false, 600).transcript, true);
   assert.equal(detect(false, 600, "original-video", null).transcript, false);
-  assert.equal(detect(false, 600, "original-video", { playerCaptionsTracklistRenderer: { captionTracks: [] } }).transcript, false);
+  assert.equal(
+    detect(false, 600, "original-video", { playerCaptionsTracklistRenderer: { captionTracks: [] } })
+      .transcript,
+    false,
+  );
   assert.equal(detect(false, 600, "previous-video", null).transcript, true);
 });
 
@@ -774,7 +959,10 @@ test("a click sends validated model output to the production renderer for the or
   assert.equal(app.clones.length, 1);
   assert.equal(app.clones[0].destroyed, 1);
   assert.equal(app.sessions[0].signal.aborted, true);
-  assert.deepEqual([...app.prompts[0].options.responseConstraint.required], ["chapter1", "chapter2", "chapter3", "chapter4"]);
+  assert.deepEqual(
+    [...app.prompts[0].options.responseConstraint.required],
+    ["chapter1", "chapter2", "chapter3", "chapter4"],
+  );
   assert.equal(app.prompts[0].options.responseConstraint.properties.chapter1.maxLength, 40);
   assert.equal(app.prompts[0].options.omitResponseConstraintInput, true);
   assert.match(app.prompts[0].text, /The video is titled "Architecture talk"/);
@@ -833,7 +1021,10 @@ for (const [name, transcriptResult, message] of [
       assert.equal(app.prompted(), 0);
       assert.equal(app.destroyed(), 0);
       assert.equal(app.sessions[0].signal.aborted, true);
-      assert.equal(app.label.textContent, name === "serialized error" ? "Generate chapters" : "Try again");
+      assert.equal(
+        app.label.textContent,
+        name === "serialized error" ? "Generate chapters" : "Try again",
+      );
     } finally {
       model.resolve();
       await run;
@@ -910,7 +1101,7 @@ for (const [name, options, usesModel] of [
     const app = popup({ ...options, availabilityReady: availability.promise });
     const run = app.click();
     await tick();
-    assert.equal(app.label.textContent, "Generating chapters...");
+    assert.equal(app.label.textContent, "Generating chapters");
     assert.equal(app.calls.length, 0, "the run waits for its model read");
     availability.resolve();
     await run;
@@ -920,7 +1111,7 @@ for (const [name, options, usesModel] of [
       assert.equal(JSON.parse(JSON.stringify(app.calls[1].args[0]))[0].title, "Generated opening");
     } else assertKeywordChapters(app);
     assertSuccess(app, { modelOnDevice: usesModel });
-    assert.deepEqual(app.labels, ["Generate chapters", "Generating chapters...", "Chapters added"]);
+    assert.deepEqual(app.labels, ["Generate chapters", "Generating chapters", "Chapters added"]);
     await app.ready;
   });
 }
@@ -951,7 +1142,11 @@ for (const [name, options, offered] of [
   ["a model still downloading", { availability: "downloading" }, false],
   ["an unavailable model", { availability: "unavailable" }, false],
   ["a missing Prompt API", { missingApi: true }, false],
-  ["a blocked video", { availability: "downloadable", chapterState: { blocked: "Video too short" } }, false],
+  [
+    "a blocked video",
+    { availability: "downloadable", chapterState: { blocked: "Video too short" } },
+    false,
+  ],
 ]) {
   test(`${name} ${offered ? "offers" : "does not offer"} better titles`, async () => {
     const app = popup(options);
@@ -1036,7 +1231,10 @@ test("download progress never overwrites a failure the user must read", async ()
 });
 
 test("an ad after a ticked click keeps the offer hidden and starts no second download", async () => {
-  const options = { availability: "downloadable", transcriptResultError: "Wait for the ad to finish" };
+  const options = {
+    availability: "downloadable",
+    transcriptResultError: "Wait for the ad to finish",
+  };
   const app = popup(options);
   await app.ready;
   app.optIn.checked = true;
@@ -1092,19 +1290,45 @@ test("a model that goes away after the popup's read leaves the chapters to the k
   assertSuccess(app);
 });
 
+test("a failed model availability check still adds keyword chapters", async () => {
+  const app = popup({ availabilityError: new Error("Availability check failed") });
+  await app.ready;
+  assert.equal(app.button.disabled, false);
+  await app.click();
+  assert.equal(app.sessions.length, 0);
+  assert.equal(app.prompted(), 0);
+  assert.equal(app.calls.length, 2);
+  assertKeywordChapters(app);
+  assertSuccess(app, { modelOnDevice: false });
+  assert.equal(app.errors.length, 0);
+});
+
 // Evaluation runs ask for the model and nothing else, so a missing model stays a failed run.
 for (const [name, options] of [
   ["a model that went away", { availability: "unavailable" }],
   ["a missing Prompt API", { missingApi: true }],
+  ["a failed availability check", { availabilityError: new Error("Availability check failed") }],
 ]) {
   test(`${name} fails a run that asked for no keyword titles`, async () => {
     const app = popup(options);
-    const run = { loadTranscript: async () => harnessTranscript, controller: new AbortController(), useModel: true };
-    await assert.rejects(app.generateChapterData(run), /Gemini Nano unavailable/);
+    const run = {
+      loadTranscript: async () => harnessTranscript,
+      controller: new AbortController(),
+      useModel: true,
+    };
+    await assert.rejects(
+      app.generateChapterData(run),
+      options.availabilityError || /Gemini Nano unavailable/,
+    );
     const { chapters } = await app.generateChapterData({
-      ...run, controller: new AbortController(), fallbackTitles: true,
+      ...run,
+      controller: new AbortController(),
+      fallbackTitles: true,
     });
-    assert.deepEqual(JSON.parse(JSON.stringify(chapters)).map(chapter => chapter.timestamp), [0, 180, 360, 540]);
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(chapters)).map((chapter) => chapter.timestamp),
+      [0, 180, 360, 540],
+    );
   });
 }
 
@@ -1112,7 +1336,11 @@ test("model startup and transcript setup spend the click's title budget", async 
   const model = deferred();
   const transcript = deferred();
   const prompt = deferred();
-  const app = popup({ modelReady: model.promise, transcriptReady: transcript.promise, promptReady: prompt.promise });
+  const app = popup({
+    modelReady: model.promise,
+    transcriptReady: transcript.promise,
+    promptReady: prompt.promise,
+  });
   await app.ready;
   const run = app.click();
   await tick();
@@ -1159,15 +1387,27 @@ for (const [name, options] of [
     assert.equal(app.sessions.length, 0);
     assert.equal(app.calls.length, 2);
     assert.equal(app.errors.length, 0);
-    assert.ok(!app.labels.some(text => /Nano|Chrome AI/.test(text)), app.labels.join(" | "));
+    assert.ok(!app.labels.some((text) => /Nano|Chrome AI/.test(text)), app.labels.join(" | "));
   });
 }
 
 for (const [name, options, message] of [
   ["no active tab", { tab: null }, /Open a YouTube video/],
-  ["non-YouTube tab", { tab: { id: 42, url: "https://example.com/watch?v=test" } }, /Open a YouTube video/],
-  ["empty video id", { tab: { id: 42, url: "https://www.youtube.com/watch?v=" } }, /Open a YouTube video/],
-  ["insecure page", { tab: { id: 42, url: "http://www.youtube.com/watch?v=test" } }, /Open a YouTube video/],
+  [
+    "non-YouTube tab",
+    { tab: { id: 42, url: "https://example.com/watch?v=test" } },
+    /Open a YouTube video/,
+  ],
+  [
+    "empty video id",
+    { tab: { id: 42, url: "https://www.youtube.com/watch?v=" } },
+    /Open a YouTube video/,
+  ],
+  [
+    "insecure page",
+    { tab: { id: 42, url: "http://www.youtube.com/watch?v=test" } },
+    /Open a YouTube video/,
+  ],
 ]) {
   test(`${name} disables generation with a readable explanation before model creation`, async () => {
     const app = popup(options);
@@ -1196,24 +1436,50 @@ for (const [name, options, message] of [
 }
 
 test("sparse captions give fewer chapters instead of invented starts", async () => {
-  const app = popup({ transcriptResult: { duration: 720, cues: [{ time: 0, text: "Only opening words" }], title: "Sparse talk" } });
+  const app = popup({
+    transcriptResult: {
+      duration: 720,
+      cues: [{ time: 0, text: "Only opening words" }],
+      title: "Sparse talk",
+    },
+  });
   await app.ready;
   await app.click();
   assert.equal(app.body.dataset.state, "success");
   assert.deepEqual([...app.prompts[0].options.responseConstraint.required], ["chapter1"]);
-  assert.deepEqual(JSON.parse(JSON.stringify(app.calls[1].args[0])), [{ timestamp: 0, title: "Generated opening" }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(app.calls[1].args[0])), [
+    { timestamp: 0, title: "Generated opening" },
+  ]);
   assert.equal(app.destroyed(), 1);
 });
 
-const generatedTitles = Object.fromEntries(Object.entries(generated).map(([key, chapter]) => [key, chapter.title]));
-const modelTitles = Object.values(generatedTitles).map(title => title.trim());
+const generatedTitles = Object.fromEntries(
+  Object.entries(generated).map(([key, chapter]) => [key, chapter.title]),
+);
+const modelTitles = Object.values(generatedTitles).map((title) => title.trim());
 for (const [name, options, keyword] of [
-  ["missing title key", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: undefined }) }, [1]],
-  ["extra title key", { titleRaw: JSON.stringify({ ...generatedTitles, chapter5: "Unexpected chapter" }) }, []],
+  [
+    "missing title key",
+    { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: undefined }) },
+    [1],
+  ],
+  [
+    "extra title key",
+    { titleRaw: JSON.stringify({ ...generatedTitles, chapter5: "Unexpected chapter" }) },
+    [],
+  ],
   ["wrong title type", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: 123 }) }, [1]],
   ["blank title", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: "   " }) }, [1]],
-  ["oversized title", { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: "x".repeat(61) }) }, [1]],
-  ["narrative outside JSON", { titleRaw: "Here are the chapters: " + JSON.stringify(generatedTitles) }, []],
+  [
+    "oversized title",
+    { titleRaw: JSON.stringify({ ...generatedTitles, chapter2: "x".repeat(61) }) },
+    [1],
+  ],
+  [
+    "narrative outside JSON",
+    { titleRaw: "Here are the chapters: " + JSON.stringify(generatedTitles) },
+    [],
+  ],
   ["a model failure", { titleError: new Error("Model failed") }, [0, 1, 2, 3]],
 ]) {
   // Every usable title counts on its own; a chapter without one keeps its keyword title rather than failing the run.
@@ -1222,7 +1488,10 @@ for (const [name, options, keyword] of [
     await app.ready;
     await app.click();
     assertSuccess(app);
-    assertKeywordChapters(app, modelTitles.map((title, index) => keyword.includes(index) ? undefined : title));
+    assertKeywordChapters(
+      app,
+      modelTitles.map((title, index) => (keyword.includes(index) ? undefined : title)),
+    );
     assert.equal(app.prompted(), 1);
     assert.equal(app.calls.length, 2);
     assert.equal(app.destroyed(), 1);
@@ -1230,9 +1499,14 @@ for (const [name, options, keyword] of [
 }
 
 test("a run of whitespace ends the batch and keeps the titles finished before it", async () => {
-  const app = popup({ titleRaw: [
-    `{"chapter1": "${modelTitles[0]}", "chapter2": "${modelTitles[1]}",`, "\n".repeat(12), "\n".repeat(12), '"chapter3": "Late title"}',
-  ] });
+  const app = popup({
+    titleRaw: [
+      `{"chapter1": "${modelTitles[0]}", "chapter2": "${modelTitles[1]}",`,
+      "\n".repeat(12),
+      "\n".repeat(12),
+      '"chapter3": "Late title"}',
+    ],
+  });
   await app.ready;
   await app.click();
   assertSuccess(app);
@@ -1243,23 +1517,49 @@ test("a run of whitespace ends the batch and keeps the titles finished before it
 });
 
 test("titles are asked eight chapters at a time, each batch in its own copy of the session", async () => {
-  const transcriptResult = { duration: 2400, cues: Array.from({ length: 160 }, (_, index) => ({ time: index * 15, text: `Next, topic ${index}.` })), title: "Long talk" };
+  const transcriptResult = {
+    duration: 2400,
+    cues: Array.from({ length: 160 }, (_, index) => ({
+      time: index * 15,
+      text: `Next, topic ${index}.`,
+    })),
+    title: "Long talk",
+  };
   const app = popup({ transcriptResult });
   await app.ready;
   await app.click();
   assertSuccess(app);
   const starts = [...app.selectStarts(transcriptResult)];
   assert.equal(starts.length, 14);
-  assert.deepEqual(app.prompts.map(prompt => prompt.options.responseConstraint.required.length), [8, 6]);
-  assert.match(app.prompts[0].text, new RegExp(`chapter8 contains ONLY ${starts[7]}-${starts[8]} seconds`));
+  assert.deepEqual(
+    app.prompts.map((prompt) => prompt.options.responseConstraint.required.length),
+    [8, 6],
+  );
+  assert.match(
+    app.prompts[0].text,
+    new RegExp(`chapter8 contains ONLY ${starts[7]}-${starts[8]} seconds`),
+  );
   assert.match(app.prompts[1].text, new RegExp(`chapter1 contains ONLY ${starts[8]}-`));
-  assert.deepEqual(app.clones.map(clone => clone.destroyed), [1, 1]);
+  assert.deepEqual(
+    app.clones.map((clone) => clone.destroyed),
+    [1, 1],
+  );
   assert.equal(app.destroyed(), 1);
   // The second batch's chapter1 is the video's ninth chapter. Keyword phrases a model title lacks follow a colon.
   const chapters = JSON.parse(JSON.stringify(app.calls[1].args[0]));
-  assert.deepEqual(chapters.map(chapter => chapter.timestamp), starts);
-  const batch = count => Array.from({ length: count }, (_, index) => modelTitles[index] ?? `Generated part ${index + 1}`);
-  assert.deepEqual(chapters.map(chapter => chapter.title.split(": ")[0]), [...batch(8), ...batch(6)]);
+  assert.deepEqual(
+    chapters.map((chapter) => chapter.timestamp),
+    starts,
+  );
+  const batch = (count) =>
+    Array.from(
+      { length: count },
+      (_, index) => modelTitles[index] ?? `Generated part ${index + 1}`,
+    );
+  assert.deepEqual(
+    chapters.map((chapter) => chapter.title.split(": ")[0]),
+    [...batch(8), ...batch(6)],
+  );
 });
 
 test("a single JSON fence is accepted without repairing title contents", async () => {
@@ -1272,50 +1572,95 @@ test("a single JSON fence is accepted without repairing title contents", async (
 
 test("title sections contain their selected spans and exclude the next section", () => {
   const app = popup();
-  const prompt = app.buildTitlePrompt([
-    { time: 0, text: "Opening evidence" }, { time: 50, text: "Transition evidence" },
-    { time: 99, text: "Closing evidence" },
-  ], 100, [0, 50]);
+  const prompt = app.buildTitlePrompt(
+    [
+      { time: 0, text: "Opening evidence" },
+      { time: 50, text: "Transition evidence" },
+      { time: 99, text: "Closing evidence" },
+    ],
+    100,
+    [0, 50],
+  );
   const firstSection = prompt.split("chapter1 contains ONLY")[1].split("chapter2 contains ONLY")[0];
   assert.match(firstSection, /Opening evidence/);
   assert.doesNotMatch(firstSection, /Transition evidence|Closing evidence/);
-  assert.match(prompt.split("chapter2 contains ONLY")[1], /Transition evidence[\s\S]*Closing evidence/);
+  assert.match(
+    prompt.split("chapter2 contains ONLY")[1],
+    /Transition evidence[\s\S]*Closing evidence/,
+  );
 });
 
 test("dense transcripts keep a full batch's title prompt bounded", () => {
   const app = popup();
-  const cues = Array.from({ length: 7200 }, (_, time) => ({ time, text: "Dense caption content ".repeat(100) }));
+  const cues = Array.from({ length: 7200 }, (_, time) => ({
+    time,
+    text: "Dense caption content ".repeat(100),
+  }));
   const batch = Array.from({ length: 8 }, (_, index) => index * 900);
   assert.ok(app.buildTitlePrompt(cues, 7200, batch).length < 11_000);
 });
 
 test("title sections show a short section whole and sample a long one evenly from its start to its end", () => {
   const app = popup();
-  const cues = Array.from({ length: 40 }, (_, index) => ({ time: index * 5, text: `Cue ${index}` }));
-  const lines = app.buildTitlePrompt(cues, 200, [0]).split("chapter1 contains ONLY 0-200 seconds:\n")[1].split("\n");
+  const cues = Array.from({ length: 40 }, (_, index) => ({
+    time: index * 5,
+    text: `Cue ${index}`,
+  }));
+  const lines = app
+    .buildTitlePrompt(cues, 200, [0])
+    .split("chapter1 contains ONLY 0-200 seconds:\n")[1]
+    .split("\n");
   // A section that fits is shown whole, its captions joined in runs of about the same length.
-  const run = part => part.map(cue => cue.text).join(" ");
+  const run = (part) => part.map((cue) => cue.text).join(" ");
   assert.deepEqual(lines, [`0s ${run(cues.slice(0, 21))}`, `105s ${run(cues.slice(21))}`]);
-  const long = Array.from({ length: 400 }, (_, index) => ({ time: index * 5, text: `Cue ${index} says a few more words about this part` }));
-  const times = app.buildTitlePrompt(long, 2000, [0]).split("seconds:\n")[1].split("\n").map(line => parseInt(line));
+  const long = Array.from({ length: 400 }, (_, index) => ({
+    time: index * 5,
+    text: `Cue ${index} says a few more words about this part`,
+  }));
+  const times = app
+    .buildTitlePrompt(long, 2000, [0])
+    .split("seconds:\n")[1]
+    .split("\n")
+    .map((line) => parseInt(line));
   // A long section shows runs that start at about even steps, so its end reaches the model as often as its start.
   assert.equal(times[0], 0);
   assert.ok(times.at(-1) >= 1900, `${times}`);
-  assert.ok(times.slice(1).every((time, index) => Math.abs(time - times[index] - 2000 / times.length) <= 10), `${times}`);
+  assert.ok(
+    times
+      .slice(1)
+      .every((time, index) => Math.abs(time - times[index] - 2000 / times.length) <= 10),
+    `${times}`,
+  );
 });
 
 test("chapter count follows duration and starts stay half an average chapter apart, with the first allowed from 60 s", () => {
   const app = popup();
   // Every caption announces a topic, so only duration and spacing limit the choice.
-  const transcript = duration => ({ duration, cues: Array.from({ length: Math.ceil(duration / 15) }, (_, index) => ({ time: index * 15, text: `Next, topic ${index}.` })) });
+  const transcript = (duration) => ({
+    duration,
+    cues: Array.from({ length: Math.ceil(duration / 15) }, (_, index) => ({
+      time: index * 15,
+      text: `Next, topic ${index}.`,
+    })),
+  });
   // 3.86 x minutes^0.355 rounds from 8 to 9 at 555 s. At 2880 s it gives 15, but 16 chapters keep each within 180 s.
-  for (const [duration, count] of [[60, 4], [554, 8], [555, 9], [2880, 16], [3000, 16], [7200, 16]]) {
+  for (const [duration, count] of [
+    [60, 4],
+    [554, 8],
+    [555, 9],
+    [2880, 16],
+    [3000, 16],
+    [7200, 16],
+  ]) {
     const starts = app.selectStarts(transcript(duration));
     assert.equal(starts.length, count, `${duration}`);
     assert.equal(starts[0], 0);
     const gap = duration / count / 2;
     starts.slice(1).forEach((start, index) => {
-      assert.ok(start - starts[index] >= (index ? gap : Math.min(gap, 60)) && start <= duration - gap, `${duration}: ${starts}`);
+      assert.ok(
+        start - starts[index] >= (index ? gap : Math.min(gap, 60)) && start <= duration - gap,
+        `${duration}: ${starts}`,
+      );
     });
     // Creators often end an intro at about a minute, so the first start may sit there on long videos.
     if (duration === 3000) assert.equal(starts[1], 60);
@@ -1324,38 +1669,83 @@ test("chapter count follows duration and starts stay half an average chapter apa
 
 test("starts prefer announced topic changes over continuing captions", () => {
   const app = popup();
-  const filler = ["and the same part keeps going here", "with more of the same example text", "still about the same part of this story"];
-  const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: filler[index % 3] }));
-  for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."], [570, "Finally, the verdict."]]) {
-    cues.find(cue => cue.time === time).text = text;
+  const filler = [
+    "and the same part keeps going here",
+    "with more of the same example text",
+    "still about the same part of this story",
+  ];
+  const cues = Array.from({ length: 48 }, (_, index) => ({
+    time: index * 15,
+    text: filler[index % 3],
+  }));
+  for (const [time, text] of [
+    [165, "Next, let's talk about batteries."],
+    [390, "Moving on to the camera."],
+    [570, "Finally, the verdict."],
+  ]) {
+    cues.find((cue) => cue.time === time).text = text;
   }
   // Twelve minutes get nine chapters, so continuing captions fill the starts the announcements leave.
   const starts = [...app.selectStarts({ duration: 720, cues })];
   assert.equal(starts.length, 9);
-  assert.ok([165, 390, 570].every(time => starts.includes(time)), `${starts}`);
+  assert.ok(
+    [165, 390, 570].every((time) => starts.includes(time)),
+    `${starts}`,
+  );
 });
 
 test("starts ignore captions that only look like announcements or questions", () => {
   const app = popup();
   // Punctuated filler keeps these decoys on the punctuated path; unpunctuated captions ignore line-start openers.
-  const filler = ["and the same part keeps going here.", "with more of the same example text.", "still about the same part of this story."];
-  for (const decoy of ["Now, if the same part keeps going here", "So what is the same part keeps going", "and the same part keeps going, right?", "[music] and the same part keeps going here"]) {
-    const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: filler[index % 3] }));
-    for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."], [570, decoy]]) {
-      cues.find(cue => cue.time === time).text = text;
+  const filler = [
+    "and the same part keeps going here.",
+    "with more of the same example text.",
+    "still about the same part of this story.",
+  ];
+  for (const decoy of [
+    "Now, if the same part keeps going here",
+    "So what is the same part keeps going",
+    "and the same part keeps going, right?",
+    "[music] and the same part keeps going here",
+  ]) {
+    const cues = Array.from({ length: 48 }, (_, index) => ({
+      time: index * 15,
+      text: filler[index % 3],
+    }));
+    for (const [time, text] of [
+      [165, "Next, let's talk about batteries."],
+      [390, "Moving on to the camera."],
+      [570, decoy],
+    ]) {
+      cues.find((cue) => cue.time === time).text = text;
     }
     const starts = app.selectStarts({ duration: 720, cues });
-    assert.ok(starts.includes(165) && starts.includes(390) && !starts.includes(570), `${decoy}: ${starts}`);
+    assert.ok(
+      starts.includes(165) && starts.includes(390) && !starts.includes(570),
+      `${decoy}: ${starts}`,
+    );
   }
 });
 
 test("a speaker turn that opens with a real question starts a chapter", () => {
   const app = popup();
   // The turn reuses the filler's words, so only its question, not new vocabulary, can make it a start.
-  for (const [end, asked] of [["?", true], [".", false]]) {
-    const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: "and the same part keeps going here" }));
-    for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."], [495, "- Did pricing change later?"], [570, "- Why does the same part keep going"], [585, `here after all this time${end}`]]) {
-      cues.find(cue => cue.time === time).text = text;
+  for (const [end, asked] of [
+    ["?", true],
+    [".", false],
+  ]) {
+    const cues = Array.from({ length: 48 }, (_, index) => ({
+      time: index * 15,
+      text: "and the same part keeps going here",
+    }));
+    for (const [time, text] of [
+      [165, "Next, let's talk about batteries."],
+      [390, "Moving on to the camera."],
+      [495, "- Did pricing change later?"],
+      [570, "- Why does the same part keep going"],
+      [585, `here after all this time${end}`],
+    ]) {
+      cues.find((cue) => cue.time === time).text = text;
     }
     const starts = [...app.selectStarts({ duration: 720, cues })];
     assert.ok(starts.includes(570) === asked && !starts.includes(495), `${end}: ${starts}`);
@@ -1364,65 +1754,123 @@ test("a speaker turn that opens with a real question starts a chapter", () => {
 
 test("a section marker inside a long caption starts a chapter at its own sentence", () => {
   const app = popup();
-  const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: "and the same part keeps going here" }));
-  for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."]]) {
-    cues.find(cue => cue.time === time).text = text;
+  const cues = Array.from({ length: 48 }, (_, index) => ({
+    time: index * 15,
+    text: "and the same part keeps going here",
+  }));
+  for (const [time, text] of [
+    [165, "Next, let's talk about batteries."],
+    [390, "Moving on to the camera."],
+  ]) {
+    cues.find((cue) => cue.time === time).text = text;
   }
   // Auto-generated captions hold several sentences; "Part three." sits 30 of 60 characters into a 15-second caption.
-  cues.find(cue => cue.time === 555).text = "the same part keeps going. Part three. The verdict here.";
+  cues.find((cue) => cue.time === 555).text =
+    "the same part keeps going. Part three. The verdict here.";
   const starts = [...app.selectStarts({ duration: 720, cues })];
-  assert.ok([165, 390, 562].every(time => starts.includes(time)) && !starts.includes(555), `${starts}`);
-  const sections = app.splitAtStarts(cues, 720, starts).filter(cue => cue.time >= 555 && cue.time < 570);
-  assert.deepEqual(sections.map(cue => [cue.time, cue.text]), [[555, "the same part keeps going."], [562, "Part three. The verdict here."]]);
+  assert.ok(
+    [165, 390, 562].every((time) => starts.includes(time)) && !starts.includes(555),
+    `${starts}`,
+  );
+  const sections = app
+    .splitAtStarts(cues, 720, starts)
+    .filter((cue) => cue.time >= 555 && cue.time < 570);
+  assert.deepEqual(
+    sections.map((cue) => [cue.time, cue.text]),
+    [
+      [555, "the same part keeps going."],
+      [562, "Part three. The verdict here."],
+    ],
+  );
 });
 
 test("step openings and questions inside a caption do not start chapters", () => {
   const app = popup();
-  const filler = ["and the same part keeps going here", "with more of the same example text", "still about the same part of this story"];
-  for (const inside of ["Let's go back to the beginning.", "Now I can play it.", "So what did he do?", "Okay, so we keep going."]) {
-    const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: filler[index % 3] }));
-    for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."], [555, `the same part keeps going. ${inside}`]]) {
-      cues.find(cue => cue.time === time).text = text;
+  const filler = [
+    "and the same part keeps going here",
+    "with more of the same example text",
+    "still about the same part of this story",
+  ];
+  for (const inside of [
+    "Let's go back to the beginning.",
+    "Now I can play it.",
+    "So what did he do?",
+    "Okay, so we keep going.",
+  ]) {
+    const cues = Array.from({ length: 48 }, (_, index) => ({
+      time: index * 15,
+      text: filler[index % 3],
+    }));
+    for (const [time, text] of [
+      [165, "Next, let's talk about batteries."],
+      [390, "Moving on to the camera."],
+      [555, `the same part keeps going. ${inside}`],
+    ]) {
+      cues.find((cue) => cue.time === time).text = text;
     }
     const starts = app.selectStarts({ duration: 720, cues });
-    assert.ok(starts.every(start => start < 555 || start >= 570), `${inside}: ${starts}`);
+    assert.ok(
+      starts.every((start) => start < 555 || start >= 570),
+      `${inside}: ${starts}`,
+    );
   }
 });
 
 test("in unpunctuated captions a section word or topic turn starts a chapter at its own word, even across lines", () => {
   const app = popup();
-  const cues = Array.from({ length: 240 }, (_, index) => ({ time: index * 3, text: "and the same part keeps going here" }));
+  const cues = Array.from({ length: 240 }, (_, index) => ({
+    time: index * 3,
+    text: "and the same part keeps going here",
+  }));
   // "step number two" begins 30 of 34 characters into the 3-second line at 165 and ends on the next line.
-  cues.find(cue => cue.time === 165).text = "and the same part keeps going step";
-  cues.find(cue => cue.time === 168).text = "number two is the battery test";
-  cues.find(cue => cue.time === 390).text = "so speaking of the camera lens";
-  cues.find(cue => cue.time === 570).text = "my final point is the verdict";
+  cues.find((cue) => cue.time === 165).text = "and the same part keeps going step";
+  cues.find((cue) => cue.time === 168).text = "number two is the battery test";
+  cues.find((cue) => cue.time === 390).text = "so speaking of the camera lens";
+  cues.find((cue) => cue.time === 570).text = "my final point is the verdict";
   const starts = [...app.selectStarts({ duration: 720, cues })];
-  assert.ok([167, 390, 570].every(time => starts.includes(time)) && !starts.includes(165) && !starts.includes(168), `${starts}`);
+  assert.ok(
+    [167, 390, 570].every((time) => starts.includes(time)) &&
+      !starts.includes(165) &&
+      !starts.includes(168),
+    `${starts}`,
+  );
 });
 
 test("in unpunctuated captions an opener at a line start does not announce", () => {
   const app = popup();
-  const cues = Array.from({ length: 240 }, (_, index) => ({ time: index * 3, text: "and the same part keeps going here" }));
-  cues.find(cue => cue.time === 165).text = "moving on to the battery";
-  cues.find(cue => cue.time === 390).text = "let's talk about the camera";
+  const cues = Array.from({ length: 240 }, (_, index) => ({
+    time: index * 3,
+    text: "and the same part keeps going here",
+  }));
+  cues.find((cue) => cue.time === 165).text = "moving on to the battery";
+  cues.find((cue) => cue.time === 390).text = "let's talk about the camera";
   // A width break put "next" at the start of a line in the middle of a sentence.
-  cues.find(cue => cue.time === 567).text = "and the same part keeps going and";
-  cues.find(cue => cue.time === 570).text = "next to it the same part keeps";
+  cues.find((cue) => cue.time === 567).text = "and the same part keeps going and";
+  cues.find((cue) => cue.time === 570).text = "next to it the same part keeps";
   const starts = [...app.selectStarts({ duration: 720, cues })];
   assert.ok(starts.includes(165) && starts.includes(390) && !starts.includes(570), `${starts}`);
 });
 
 test("a topic turn inside a punctuated caption starts a chapter at its own word", () => {
   const app = popup();
-  const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: "And the same part keeps going here." }));
-  for (const [time, text] of [[165, "Next, let's talk about batteries."], [390, "Moving on to the camera."]]) {
-    cues.find(cue => cue.time === time).text = text;
+  const cues = Array.from({ length: 48 }, (_, index) => ({
+    time: index * 15,
+    text: "And the same part keeps going here.",
+  }));
+  for (const [time, text] of [
+    [165, "Next, let's talk about batteries."],
+    [390, "Moving on to the camera."],
+  ]) {
+    cues.find((cue) => cue.time === time).text = text;
   }
   // "speaking of" begins 20 of 55 characters into a 15-second caption, mid-sentence.
-  cues.find(cue => cue.time === 555).text = "It keeps going, and speaking of the verdict, it's good.";
+  cues.find((cue) => cue.time === 555).text =
+    "It keeps going, and speaking of the verdict, it's good.";
   const starts = [...app.selectStarts({ duration: 720, cues })];
-  assert.ok([165, 390, 560].every(time => starts.includes(time)) && !starts.includes(555), `${starts}`);
+  assert.ok(
+    [165, 390, 560].every((time) => starts.includes(time)) && !starts.includes(555),
+    `${starts}`,
+  );
 });
 
 test("a caption of only sounds never becomes a start", () => {
@@ -1431,14 +1879,23 @@ test("a caption of only sounds never becomes a start", () => {
     const cues = [];
     for (let time = 0; time < 720; time += 3) {
       if (time === 555 || time === 558) continue;
-      cues.push({ time, text: time < 552 ? "and the same part keeps going here" : `battery chemistry ${time} changes charging behaviour` });
+      cues.push({
+        time,
+        text:
+          time < 552
+            ? "and the same part keeps going here"
+            : `battery chemistry ${time} changes charging behaviour`,
+      });
     }
-    cues.find(cue => cue.time === 165).text = "next let's talk about batteries";
-    cues.find(cue => cue.time === 390).text = "moving on to the camera";
-    cues.find(cue => cue.time === 552).text = sound;
+    cues.find((cue) => cue.time === 165).text = "next let's talk about batteries";
+    cues.find((cue) => cue.time === 390).text = "moving on to the camera";
+    cues.find((cue) => cue.time === 552).text = sound;
     const starts = [...app.selectStarts({ duration: 720, cues })];
     // The vocabulary dip is measured every 5 seconds, so the start can land on the last line before the break.
-    assert.ok(!starts.includes(552) && starts.some(start => start >= 549 && start <= 561), `${sound}: ${starts}`);
+    assert.ok(
+      !starts.includes(552) && starts.some((start) => start >= 549 && start <= 561),
+      `${sound}: ${starts}`,
+    );
   }
 });
 
@@ -1446,47 +1903,84 @@ test("a lasting change of vocabulary outranks a question inside a topic", () => 
   const app = popup();
   // Three topics with their own words and no spoken marker; each caption also has words of its own, and a question
   // sits inside each topic.
-  const topics = [["battery", "charging", "cable"], ["camera", "lens", "sensor"], ["speaker", "volume", "bass"]];
+  const topics = [
+    ["battery", "charging", "cable"],
+    ["camera", "lens", "sensor"],
+    ["speaker", "volume", "bass"],
+  ];
   const cues = Array.from({ length: 48 }, (_, index) => {
-    const [first, second] = [topics[Math.floor(index / 16)][index % 3], topics[Math.floor(index / 16)][(index + 1) % 3]];
-    return { time: index * 15, text: `The ${first} and ${second} matter for item${index} and extra${index}.` };
+    const [first, second] = [
+      topics[Math.floor(index / 16)][index % 3],
+      topics[Math.floor(index / 16)][(index + 1) % 3],
+    ];
+    return {
+      time: index * 15,
+      text: `The ${first} and ${second} matter for item${index} and extra${index}.`,
+    };
   });
-  for (const time of [105, 345, 585]) cues.find(cue => cue.time === time).text = `Why does item${time} change it?`;
+  for (const time of [105, 345, 585])
+    cues.find((cue) => cue.time === time).text = `Why does item${time} change it?`;
   const starts = [...app.selectStarts({ duration: 720, cues })];
   assert.ok(starts.includes(240) && starts.includes(480), `${starts}`);
 });
 
 test("captions without an inner section marker keep their title sections", () => {
   const app = popup();
-  const cues = [{ time: 0, text: "Opening. Still opening." }, { time: 50, text: "Middle. Next, more." }, { time: 99, text: "Closing." }];
+  const cues = [
+    { time: 0, text: "Opening. Still opening." },
+    { time: 50, text: "Middle. Next, more." },
+    { time: 99, text: "Closing." },
+  ];
   assert.deepEqual(app.splitAtStarts(cues, 100, [0, 50]), cues);
 });
 
 test("no chapter runs longer than 180 s where sixteen chapters allow it", () => {
   const app = popup();
-  const cues = Array.from({ length: 48 }, (_, index) => ({ time: index * 15, text: "and the same part keeps going here" }));
-  for (const [time, text] of [[105, "Next, the battery."], [210, "Moving on to the camera."], [315, "Finally, the verdict."]]) {
-    cues.find(cue => cue.time === time).text = text;
+  const cues = Array.from({ length: 48 }, (_, index) => ({
+    time: index * 15,
+    text: "and the same part keeps going here",
+  }));
+  for (const [time, text] of [
+    [105, "Next, the battery."],
+    [210, "Moving on to the camera."],
+    [315, "Finally, the verdict."],
+  ]) {
+    cues.find((cue) => cue.time === time).text = text;
   }
   const edges = [...app.selectStarts({ duration: 720, cues }), 720];
   assert.equal(edges.length, 10);
   // The last chapter is held to the limit only up to its last caption, then runs on to the video's end.
-  assert.ok(edges.slice(1, -1).every((edge, index) => edge - edges[index] <= 180), `${edges}`);
+  assert.ok(
+    edges.slice(1, -1).every((edge, index) => edge - edges[index] <= 180),
+    `${edges}`,
+  );
 });
 
 test("sparse captions never invent starts", () => {
   const app = popup();
-  assert.deepEqual([...app.selectStarts({ duration: 720, cues: [{ time: 0, text: "Only opening words" }] })], [0]);
+  assert.deepEqual(
+    [...app.selectStarts({ duration: 720, cues: [{ time: 0, text: "Only opening words" }] })],
+    [0],
+  );
   // Captions only in the first half minute of a 12-minute video leave no candidate half an average chapter (40 s) from
   // the start.
-  const early = Array.from({ length: 6 }, (_, index) => ({ time: index * 5, text: `Next, part ${index}.` }));
+  const early = Array.from({ length: 6 }, (_, index) => ({
+    time: index * 5,
+    text: `Next, part ${index}.`,
+  }));
   assert.deepEqual([...app.selectStarts({ duration: 720, cues: early })], [0]);
 });
 
 test("title prompt uses the video title only as naming context", () => {
   const app = popup();
-  const cues = [{ time: 0, text: "Opening evidence" }, { time: 50, text: "Later evidence" }];
-  assert.match(app.buildTitlePrompt(cues, 100, [0, 50], "Headset \"review\""), /The video is titled "Headset \\"review\\""; use that only to identify its product or subject/);
+  const cues = [
+    { time: 0, text: "Opening evidence" },
+    { time: 50, text: "Later evidence" },
+  ];
+  assert.match(
+    app.buildTitlePrompt(cues, 100, [0, 50], 'Headset "review"'),
+    /The video is titled "Headset \\"review\\""; use that only to identify its product or subject/,
+  );
   const untitled = app.buildTitlePrompt(cues, 100, [0, 50]);
   assert.doesNotMatch(untitled, /video is titled/);
   assert.match(untitled, /short label of 2 to 5 words/);
@@ -1497,12 +1991,45 @@ test("title prompt uses the video title only as naming context", () => {
 // the chapter panel's.
 const modernWatchNext = {
   currentVideoEndpoint: { watchEndpoint: { videoId: "original-video" } },
-  engagementPanels: [{ engagementPanelSectionListRenderer: { content: { structuredDescriptionContentRenderer: { items: [
-    { videoDescriptionTranscriptSectionRenderer: { primaryButton: { buttonRenderer: { command: { commandExecutorCommand: { commands: [
-      { updateEngagementPanelContentCommand: { contentSourcePanelIdentifier: { tag: "engagement-panel-macro-markers-description-chapters" } } },
-      { updateEngagementPanelContentCommand: { contentSourcePanelIdentifier: { tag: "PAmodern_transcript_view" }, globalConfiguration: { params: "modern-params" } } },
-    ] } } } } } },
-  ] } } } }],
+  engagementPanels: [
+    {
+      engagementPanelSectionListRenderer: {
+        content: {
+          structuredDescriptionContentRenderer: {
+            items: [
+              {
+                videoDescriptionTranscriptSectionRenderer: {
+                  primaryButton: {
+                    buttonRenderer: {
+                      command: {
+                        commandExecutorCommand: {
+                          commands: [
+                            {
+                              updateEngagementPanelContentCommand: {
+                                contentSourcePanelIdentifier: {
+                                  tag: "engagement-panel-macro-markers-description-chapters",
+                                },
+                              },
+                            },
+                            {
+                              updateEngagementPanelContentCommand: {
+                                contentSourcePanelIdentifier: { tag: "PAmodern_transcript_view" },
+                                globalConfiguration: { params: "modern-params" },
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  ],
 };
 
 for (const [format, panelLayout] of [
@@ -1514,8 +2041,10 @@ for (const [format, panelLayout] of [
   for (const alreadyOpen of [true, false]) {
     test(`${format} transcript reads the ${alreadyOpen ? "already-open" : "newly-opened"} ${panelLayout} panel without hidden duplicate cues`, async () => {
       const app = popup();
-      const rowTag = format === "legacy" ? "ytd-transcript-segment-renderer" : "transcript-segment-view-model";
-      const timestampSelector = format === "legacy" ? ".segment-timestamp" : ".ytwTranscriptSegmentViewModelTimestamp";
+      const rowTag =
+        format === "legacy" ? "ytd-transcript-segment-renderer" : "transcript-segment-view-model";
+      const timestampSelector =
+        format === "legacy" ? ".segment-timestamp" : ".ytwTranscriptSegmentViewModelTimestamp";
       const textSelector = format === "legacy" ? ".segment-text" : '[role="text"]';
       const row = (timestamp, text) => ({
         querySelector(selector) {
@@ -1526,10 +2055,18 @@ for (const [format, panelLayout] of [
         },
       });
       // A caption with a line break must not become its own prompt line.
-      const visibleRows = [row("0:00", "Where are all the aliens?"), row("2:14:07", "Closing\n  topic\tnow")];
+      const visibleRows = [
+        row("0:00", "Where are all the aliens?"),
+        row("2:14:07", "Closing\n  topic\tnow"),
+      ];
       const hiddenRows = [row("0:00", "Hidden duplicate"), row("2:14:07", "Hidden duplicate")];
       const rowsFor = (selector, rows) => {
-        const found = selector.split(",").map((value) => value.trim()).includes(rowTag) ? [...rows] : [];
+        const found = selector
+          .split(",")
+          .map((value) => value.trim())
+          .includes(rowTag)
+          ? [...rows]
+          : [];
         found.item = (index) => found[index];
         return found;
       };
@@ -1538,70 +2075,119 @@ for (const [format, panelLayout] of [
       let closes = 0;
       let opens = 0;
       const expanded = {
-        getAttribute: () => isExpanded ? "ENGAGEMENT_PANEL_VISIBILITY_EXPANDED" : "ENGAGEMENT_PANEL_VISIBILITY_HIDDEN",
+        getAttribute: () =>
+          isExpanded
+            ? "ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"
+            : "ENGAGEMENT_PANEL_VISIBILITY_HIDDEN",
         querySelector(selector) {
-          if (selector === "#visibility-button button") return { click() { isExpanded = false; closes++; } };
+          if (selector === "#visibility-button button")
+            return {
+              click() {
+                isExpanded = false;
+                closes++;
+              },
+            };
           return loaded ? rowsFor(selector, visibleRows)[0] || null : null;
         },
         querySelectorAll: (selector) => rowsFor(selector, loaded ? visibleRows : []),
       };
       const hidden = {
         getAttribute: () => "ENGAGEMENT_PANEL_VISIBILITY_HIDDEN",
-        querySelector() { assert.fail("Hidden duplicate panel must not be used"); },
+        querySelector() {
+          assert.fail("Hidden duplicate panel must not be used");
+        },
         querySelectorAll: (selector) => rowsFor(selector, hiddenRows),
       };
       let clock = 0;
       const styles = [];
       let requests = 0;
-      const result = await vm.runInNewContext(`(${app.fetchTranscript.toString()})("original-video")`, {
-        URL,
-        AbortSignal,
-        location: { href: "https://www.youtube.com/watch?v=original-video" },
-        window: {},
-        ytcfg: { get: () => ({}) },
-        // The newer view's own request fails here, so the reader opens the panel instead.
-        async fetch() {
-          requests++;
-          throw new TypeError("Failed to fetch");
-        },
-        performance: { now: () => clock },
-        setTimeout(callback) { clock += 50; loaded = true; callback(); },
-        document: {
-          createElement(tag) {
-            assert.equal(tag, "style");
-            const style = { textContent: "", attached: false, remove() { this.attached = false; } };
-            styles.push(style);
-            return style;
+      const result = await vm.runInNewContext(
+        `(${app.fetchTranscript.toString()})("original-video")`,
+        {
+          URL,
+          AbortSignal,
+          location: { href: "https://www.youtube.com/watch?v=original-video" },
+          window: {},
+          ytcfg: { get: () => ({}) },
+          // The newer view's own request fails here, so the reader opens the panel instead.
+          async fetch() {
+            requests++;
+            throw new TypeError("Failed to fetch");
           },
-          head: { append(style) { style.attached = true; } },
-          querySelector(selector) {
-            if (selector === "#movie_player") return {
-              classList: { contains: () => false },
-              getDuration: () => 8049.781,
-              getPlayerResponse: () => ({
-                videoDetails: { videoId: "original-video", title: "Aliens talk" },
-                captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
-              }),
-              getWatchNextResponse: () => format === "modern" ? modernWatchNext : {},
-            };
-            if (selector.startsWith("ytd-engagement-panel-section-list-renderer")) {
-              const matchesPanel = selector.split(",").some((part) => panelLayout === "legacy"
-                ? part.includes("[target-id='engagement-panel-searchable-transcript']")
-                : part.includes(loaded ? "[data-target-id='PAmodern_transcript_view']" : "[target-id='PAmodern_transcript_view']"));
-              if (!matchesPanel) return null;
-              return selector.includes("ENGAGEMENT_PANEL_VISIBILITY_EXPANDED") ? (isExpanded ? expanded : null) : hidden;
-            }
-            if (selector === "tp-yt-paper-button#expand") return null;
-            if (selector === "ytd-video-description-transcript-section-renderer button") {
-              return { click() { opens++; isExpanded = true; } };
-            }
-            return rowsFor(selector, [...hiddenRows, ...visibleRows])[0] || null;
+          performance: { now: () => clock },
+          setTimeout(callback) {
+            clock += 50;
+            loaded = true;
+            callback();
           },
-          querySelectorAll: (selector) => rowsFor(selector, [...hiddenRows, ...visibleRows]),
+          document: {
+            createElement(tag) {
+              assert.equal(tag, "style");
+              const style = {
+                textContent: "",
+                attached: false,
+                remove() {
+                  this.attached = false;
+                },
+              };
+              styles.push(style);
+              return style;
+            },
+            head: {
+              append(style) {
+                style.attached = true;
+              },
+            },
+            querySelector(selector) {
+              if (selector === "#movie_player")
+                return {
+                  classList: { contains: () => false },
+                  getDuration: () => 8049.781,
+                  getPlayerResponse: () => ({
+                    videoDetails: { videoId: "original-video", title: "Aliens talk" },
+                    captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
+                  }),
+                  getWatchNextResponse: () => (format === "modern" ? modernWatchNext : {}),
+                };
+              if (selector.startsWith("ytd-engagement-panel-section-list-renderer")) {
+                const matchesPanel = selector
+                  .split(",")
+                  .some((part) =>
+                    panelLayout === "legacy"
+                      ? part.includes("[target-id='engagement-panel-searchable-transcript']")
+                      : part.includes(
+                          loaded
+                            ? "[data-target-id='PAmodern_transcript_view']"
+                            : "[target-id='PAmodern_transcript_view']",
+                        ),
+                  );
+                if (!matchesPanel) return null;
+                return selector.includes("ENGAGEMENT_PANEL_VISIBILITY_EXPANDED")
+                  ? isExpanded
+                    ? expanded
+                    : null
+                  : hidden;
+              }
+              if (selector === "tp-yt-paper-button#expand") return null;
+              if (selector === "ytd-video-description-transcript-section-renderer button") {
+                return {
+                  click() {
+                    opens++;
+                    isExpanded = true;
+                  },
+                };
+              }
+              return rowsFor(selector, [...hiddenRows, ...visibleRows])[0] || null;
+            },
+            querySelectorAll: (selector) => rowsFor(selector, [...hiddenRows, ...visibleRows]),
+          },
         },
-      });
+      );
       assert.deepEqual(JSON.parse(JSON.stringify(result)), {
-        cues: [{ time: 0, text: "Where are all the aliens?" }, { time: 8047, text: "Closing topic now" }],
+        cues: [
+          { time: 0, text: "Where are all the aliens?" },
+          { time: 8047, text: "Closing topic now" },
+        ],
         duration: 8049.781,
         title: "Aliens talk",
       });
@@ -1622,51 +2208,92 @@ for (const [format, panelLayout] of [
 test("the newer transcript view is read by its own request, without opening the panel", async () => {
   const app = popup();
   const requests = [];
-  const segment = (timestamp, simpleText) => ({ macroMarkersPanelItemViewModel: { item: { timelineItemViewModel: {
-    contentItems: [{ transcriptSegmentViewModel: { timestamp, simpleText } }],
-  } } } });
+  const segment = (timestamp, simpleText) => ({
+    macroMarkersPanelItemViewModel: {
+      item: {
+        timelineItemViewModel: {
+          contentItems: [{ transcriptSegmentViewModel: { timestamp, simpleText } }],
+        },
+      },
+    },
+  });
   const result = await vm.runInNewContext(`(${app.fetchTranscript.toString()})("original-video")`, {
     URL,
     AbortSignal,
     location: { href: "https://www.youtube.com/watch?v=original-video" },
     window: {},
-    ytcfg: { get: (key) => key === "INNERTUBE_CONTEXT" ? { client: { clientName: "WEB" } } : undefined },
+    ytcfg: {
+      get: (key) => (key === "INNERTUBE_CONTEXT" ? { client: { clientName: "WEB" } } : undefined),
+    },
     async fetch(url, init) {
       requests.push({ url, method: init.method, body: JSON.parse(init.body) });
-      return { json: async () => ({ content: { engagementPanelSectionListRenderer: { content: { sectionListRenderer: { contents: [
-        { itemSectionRenderer: { contents: [segment("0:02", "Where are\n  all the aliens?"), segment("2:14:07", "Closing topic")] } },
-        // A segment past the video's end is dropped, as the panel reader drops it.
-        { itemSectionRenderer: { contents: [segment("2:15:00", "After the end")] } },
-      ] } } } } }) };
+      return {
+        json: async () => ({
+          content: {
+            engagementPanelSectionListRenderer: {
+              content: {
+                sectionListRenderer: {
+                  contents: [
+                    {
+                      itemSectionRenderer: {
+                        contents: [
+                          segment("0:02", "Where are\n  all the aliens?"),
+                          segment("2:14:07", "Closing topic"),
+                        ],
+                      },
+                    },
+                    // A segment past the video's end is dropped, as the panel reader drops it.
+                    { itemSectionRenderer: { contents: [segment("2:15:00", "After the end")] } },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
     },
     document: {
       createElement: () => ({ remove() {} }),
-      head: { append() { assert.fail("no panel opens, so none is hidden"); } },
+      head: {
+        append() {
+          assert.fail("no panel opens, so none is hidden");
+        },
+      },
       querySelector(selector) {
-        if (selector === "#movie_player") return {
-          classList: { contains: () => false },
-          getDuration: () => 8049.781,
-          getPlayerResponse: () => ({
-            videoDetails: { videoId: "original-video", title: "Aliens talk" },
-            captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
-          }),
-          getWatchNextResponse: () => modernWatchNext,
-        };
+        if (selector === "#movie_player")
+          return {
+            classList: { contains: () => false },
+            getDuration: () => 8049.781,
+            getPlayerResponse: () => ({
+              videoDetails: { videoId: "original-video", title: "Aliens talk" },
+              captions: { playerCaptionsTracklistRenderer: { captionTracks: [{}] } },
+            }),
+            getWatchNextResponse: () => modernWatchNext,
+          };
         // No transcript panel is open, and nothing is clicked.
         return null;
       },
     },
   });
   assert.deepEqual(JSON.parse(JSON.stringify(result)), {
-    cues: [{ time: 2, text: "Where are all the aliens?" }, { time: 8047, text: "Closing topic" }],
+    cues: [
+      { time: 2, text: "Where are all the aliens?" },
+      { time: 8047, text: "Closing topic" },
+    ],
     duration: 8049.781,
     title: "Aliens talk",
   });
-  assert.deepEqual(requests, [{
-    url: "/youtubei/v1/get_panel?prettyPrint=false",
-    method: "POST",
-    body: { context: { client: { clientName: "WEB" } }, panelId: "PAmodern_transcript_view", params: "modern-params" },
-  }]);
+  assert.deepEqual(requests, [
+    {
+      url: "/youtubei/v1/get_panel?prettyPrint=false",
+      method: "POST",
+      body: {
+        context: { client: { clientName: "WEB" } },
+        panelId: "PAmodern_transcript_view",
+        params: "modern-params",
+      },
+    },
+  ]);
 });
 
 // Without the model on the device, titles come from code and the model is never touched.
@@ -1685,77 +2312,194 @@ test("a device without the model renders code-named chapters through the product
   assert.equal(injection.args[1], "original-video");
   assertKeywordChapters(app);
   assertSuccess(app, { modelOnDevice: false });
-  assert.equal(app.labels.includes("Generating chapters..."), true);
+  assert.equal(app.labels.includes("Generating chapters"), true);
   assert.equal(app.errors.length, 0);
   assert.equal(app.timers.size, 0, "no generation timeout is armed");
 });
 
 test("section cues cover each chapter's span and split a straddling caption", () => {
   const app = popup();
-  const sections = app.sectionCues({ duration: 100, cues: [
-    { time: 0, text: "Opening words. Next, the middle topic starts here." },
-    { time: 60, text: "The end." },
-  ] }, [0, 18, 60]); // "Next," begins 15 of 51 characters in, so the split piece is timed at 18 s
-  assert.deepEqual(sections.map(section => [section.start, section.end]), [[0, 18], [18, 60], [60, 100]]);
-  assert.deepEqual(sections.map(section => section.cues.length), [1, 1, 1]);
+  const sections = app.sectionCues(
+    {
+      duration: 100,
+      cues: [
+        { time: 0, text: "Opening words. Next, the middle topic starts here." },
+        { time: 60, text: "The end." },
+      ],
+    },
+    [0, 18, 60],
+  ); // "Next," begins 15 of 51 characters in, so the split piece is timed at 18 s
+  assert.deepEqual(
+    sections.map((section) => [section.start, section.end]),
+    [
+      [0, 18],
+      [18, 60],
+      [60, 100],
+    ],
+  );
+  assert.deepEqual(
+    sections.map((section) => section.cues.length),
+    [1, 1, 1],
+  );
   assert.match(sections[1].cues[0].text, /^Next, the middle topic/);
   assert.equal(sections[1].cues[0].time, 18);
 });
 
 // Keyword titler: fixtures name the behaviour, not the whole word lists.
 function sections(...specs) {
-  return specs.map(([start, end, texts]) => ({ start, end, cues: texts.map((text, index) => ({ time: start + index * 5, text })) }));
+  return specs.map(([start, end, texts]) => ({
+    start,
+    end,
+    cues: texts.map((text, index) => ({ time: start + index * 5, text })),
+  }));
 }
 
 test("an announced topic names its section and a repeated word ends the phrase", () => {
   const app = popup();
-  const titles = app.nameChapters(sections(
-    [0, 60, ["welcome to the channel", "today we look at tents", "there are many tents"]],
-    [60, 200, ["let's talk about price the price of a premium tent is high", "price matters and the price ranges vary", "cheap tents leak"]],
-    [200, 300, ["now for the season rating", "a three season tent", "the season rating tells you", "season matters"]],
-  ), "How To Choose A Tent");
+  const titles = app.nameChapters(
+    sections(
+      [0, 60, ["welcome to the channel", "today we look at tents", "there are many tents"]],
+      [
+        60,
+        200,
+        [
+          "let's talk about price the price of a premium tent is high",
+          "price matters and the price ranges vary",
+          "cheap tents leak",
+        ],
+      ],
+      [
+        200,
+        300,
+        [
+          "now for the season rating",
+          "a three season tent",
+          "the season rating tells you",
+          "season matters",
+        ],
+      ],
+    ),
+    "How To Choose A Tent",
+  );
   // A thin first section that says a phrase of the video's title is an overview of that subject.
   assert.deepEqual(titles, ["Tents Overview", "Price", "Season Rating"]);
 });
 
 test("numbered section words become labels with the announced phrase", () => {
   const app = popup();
-  const titles = app.nameChapters(sections(
-    [0, 60, ["intro words here", "fishing is fun"]],
-    [60, 200, ["mistake five wrong strength line.", "the strength line breaks", "use a strong line", "strength line again"]],
-    [200, 300, ["mistake seven bad hooks.", "hooks rust", "sharp hooks matter", "hooks again"]],
-  ), "Fishing Mistakes");
+  const titles = app.nameChapters(
+    sections(
+      [0, 60, ["intro words here", "fishing is fun"]],
+      [
+        60,
+        200,
+        [
+          "mistake five wrong strength line.",
+          "the strength line breaks",
+          "use a strong line",
+          "strength line again",
+        ],
+      ],
+      [200, 300, ["mistake seven bad hooks.", "hooks rust", "sharp hooks matter", "hooks again"]],
+    ),
+    "Fishing Mistakes",
+  );
   // A first section of a minute is named by what it says, not Intro.
-  assert.deepEqual(titles, ["Intro Words", "Mistake 5: Wrong Strength Line", "Mistake 7: Bad Hooks"]);
+  assert.deepEqual(titles, [
+    "Intro Words",
+    "Mistake 5: Wrong Strength Line",
+    "Mistake 7: Bad Hooks",
+  ]);
 });
 
 test("a repeated collocation beats its single words without an announcement", () => {
   const app = popup();
-  const titles = app.nameChapters(sections(
-    [0, 200, ["the heating element warms the water", "a heating element can fail", "check the heating element", "hot water helps"]],
-    [200, 400, ["the rinse aid dispenser", "rinse aid stops spots", "fill the rinse aid", "rinse aid is cheap"]],
-  ), "Dishwasher Tips");
+  const titles = app.nameChapters(
+    sections(
+      [
+        0,
+        200,
+        [
+          "the heating element warms the water",
+          "a heating element can fail",
+          "check the heating element",
+          "hot water helps",
+        ],
+      ],
+      [
+        200,
+        400,
+        [
+          "the rinse aid dispenser",
+          "rinse aid stops spots",
+          "fill the rinse aid",
+          "rinse aid is cheap",
+        ],
+      ],
+    ),
+    "Dishwasher Tips",
+  );
   assert.deepEqual(titles, ["Heating Element", "Rinse Aid"]);
 });
 
 test("a section that repeats three strong phrases names all three, and one with a single phrase keeps it alone", () => {
   const app = popup();
-  const titles = app.nameChapters(sections(
-    [0, 200, ["the heating element warms the water", "a heating element can fail", "check the heating element", "the rinse aid dispenser",
-      "rinse aid stops spots", "fill the rinse aid", "the spray arm spins", "clean the spray arm", "a clogged spray arm"]],
-    [200, 400, ["the door seal keeps water in", "a worn door seal leaks", "replace the door seal", "door seal again"]],
-  ), "Dishwasher Tips");
+  const titles = app.nameChapters(
+    sections(
+      [
+        0,
+        200,
+        [
+          "the heating element warms the water",
+          "a heating element can fail",
+          "check the heating element",
+          "the rinse aid dispenser",
+          "rinse aid stops spots",
+          "fill the rinse aid",
+          "the spray arm spins",
+          "clean the spray arm",
+          "a clogged spray arm",
+        ],
+      ],
+      [
+        200,
+        400,
+        [
+          "the door seal keeps water in",
+          "a worn door seal leaks",
+          "replace the door seal",
+          "door seal again",
+        ],
+      ],
+    ),
+    "Dishwasher Tips",
+  );
   assert.deepEqual(titles, ["Heating Element, Rinse Aid & Spray Arm", "Door Seal"]);
   assert.ok(titles[0].length <= 60);
 });
 
 test("short thin edge sections read Intro and Outro, and wordless sections never throw", () => {
   const app = popup();
-  assert.deepEqual(app.nameChapters(sections(
-    [0, 20, ["hey everyone", "welcome back"]],
-    [20, 400, ["the dutch oven bakes bread", "a dutch oven holds heat", "dutch oven again", "bread bakes well"]],
-    [400, 430, ["thanks for watching", "see you next time"]],
-  ), "Sourdough"), ["Intro", "Dutch Oven", "Outro"]);
+  assert.deepEqual(
+    app.nameChapters(
+      sections(
+        [0, 20, ["hey everyone", "welcome back"]],
+        [
+          20,
+          400,
+          [
+            "the dutch oven bakes bread",
+            "a dutch oven holds heat",
+            "dutch oven again",
+            "bread bakes well",
+          ],
+        ],
+        [400, 430, ["thanks for watching", "see you next time"]],
+      ),
+      "Sourdough",
+    ),
+    ["Intro", "Dutch Oven", "Outro"],
+  );
   for (const odd of [
     sections([0, 60, ["[Music]"]], [60, 120, ["[Applause]", "[Music]"]]),
     [{ start: 0, end: 10, cues: [] }],
@@ -1764,7 +2508,10 @@ test("short thin edge sections read Intro and Outro, and wordless sections never
   ]) {
     const titles = app.nameChapters(odd, undefined);
     assert.equal(titles.length, odd.length);
-    assert.ok(titles.every(title => typeof title === "string" && title.length >= 3 && title.length <= 60), JSON.stringify(titles));
+    assert.ok(
+      titles.every((title) => typeof title === "string" && title.length >= 3 && title.length <= 60),
+      JSON.stringify(titles),
+    );
   }
 });
 
@@ -1777,6 +2524,15 @@ test("a model title cut by the length limit loses its open bracket and trailing 
 
 test("a model title takes only the keyword phrases it lacks, within 60 characters", () => {
   const app = popup();
-  assert.equal(app.withKeywords("Battery Life", "Battery Life, Fast Charging & USB-C Cable"), "Battery Life: Fast Charging, USB-C Cable");
-  assert.equal(app.withKeywords("Battery Life and Charging Speed Test", "Wireless Charging Pads & Power Delivery Standards"), "Battery Life and Charging Speed Test");
+  assert.equal(
+    app.withKeywords("Battery Life", "Battery Life, Fast Charging & USB-C Cable"),
+    "Battery Life: Fast Charging, USB-C Cable",
+  );
+  assert.equal(
+    app.withKeywords(
+      "Battery Life and Charging Speed Test",
+      "Wireless Charging Pads & Power Delivery Standards",
+    ),
+    "Battery Life and Charging Speed Test",
+  );
 });

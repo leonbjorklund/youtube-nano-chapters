@@ -12,10 +12,14 @@ let modelReady = false;
 let downloadNote = "";
 // One download per popup: an ad or a failed run must not offer the box again and start a second one.
 let downloadStarted = false;
-window.addEventListener("pagehide", () => {
-  popupClosed = true;
-  clearTimeout(adTimer);
-}, { once: true });
+window.addEventListener(
+  "pagehide",
+  () => {
+    popupClosed = true;
+    clearTimeout(adTimer);
+  },
+  { once: true },
+);
 
 // Generation runs in the service worker (background.js), so it goes on and draws the chapters after the popup
 // closes. Over this connection the popup asks whether its video is being worked on and hears how a run it follows
@@ -44,7 +48,10 @@ function send(message) {
   worker.postMessage(message);
 }
 // The worker's next reply under this key.
-const reply = (key) => new Promise((resolve) => { replies[key] = resolve; });
+const reply = (key) =>
+  new Promise((resolve) => {
+    replies[key] = resolve;
+  });
 
 // One read of the model per popup. The offer appears only where ticking it does something: Chrome has the model
 // ready to fetch. A finished download makes it "available" and the box never returns; a download that died leaves
@@ -65,7 +72,8 @@ function warmModel() {
 function showState(state, text, message = "") {
   clearTimeout(adTimer);
   document.body.dataset.state = state;
-  button.disabled = ["working", "unavailable", "blocked"].includes(state) || (state === "success" && !modelReady);
+  button.disabled =
+    ["working", "unavailable", "blocked"].includes(state) || (state === "success" && !modelReady);
   label.textContent = text;
   // An SVG element has no hidden property, so the attribute is toggled directly.
   const hideAgain = again.toggleAttribute("hidden", !(state === "success" && modelReady));
@@ -77,7 +85,8 @@ function showState(state, text, message = "") {
 
 function showDownload(loaded) {
   downloadNote = `Downloading model ${Math.round(loaded * 100)}%`;
-  if (!popupClosed && ["idle", "success"].includes(document.body.dataset.state)) status.textContent = downloadNote;
+  if (!popupClosed && ["idle", "success"].includes(document.body.dataset.state))
+    status.textContent = downloadNote;
 }
 
 button.addEventListener("click", () => {
@@ -88,17 +97,19 @@ button.addEventListener("click", () => {
     downloadStarted = true;
     startModelDownload(showDownload);
   }
-  return follow(activeVideo().then((video) => {
-    const ended = reply("ended");
-    send({ generate: video });
-    return ended;
-  }));
+  return follow(
+    activeVideo().then((video) => {
+      const ended = reply("ended");
+      send({ generate: video });
+      return ended;
+    }),
+  );
 });
 
 // Shows a run working until it ends, then how it ended.
 async function follow(run) {
   generationStarted = true;
-  showState("working", "Generating chapters...");
+  showState("working", "Generating chapters");
   try {
     const { error } = await run;
     if (error) throw new Error(error);
@@ -114,32 +125,49 @@ async function follow(run) {
 function showError(error) {
   if (error.message === "Open a YouTube video") {
     showState("unavailable", "Open a YouTube video");
-  // A device that can't run Gemini Nano is never told so: the popup names only reasons the user can act on.
-  } else if (["Video too short", "Wait for the ad to finish", "Live videos aren't supported"].includes(error.message)) {
+    // A device that can't run Gemini Nano is never told so: the popup names only reasons the user can act on.
+  } else if (
+    ["Video too short", "Wait for the ad to finish", "Live videos aren't supported"].includes(
+      error.message,
+    )
+  ) {
     showState("blocked", "Generate chapters", error.message);
     if (error.message === "Wait for the ad to finish" && !popupClosed) {
       adTimer = setTimeout(() => showVideoState(true), 750);
     }
   } else {
     const messages = ["Video changed", "Video still loading", "Can't access this video"];
-    showState("error", "Try again", messages.includes(error.message) ? error.message : "Couldn't generate chapters");
+    showState(
+      "error",
+      "Try again",
+      messages.includes(error.message) ? error.message : "Couldn't generate chapters",
+    );
   }
 }
 
 async function activeVideo() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const url = tab?.url ? new URL(tab.url) : null;
-  if (!tab?.id || !url || url.protocol !== "https:" ||
-      !(url.hostname === "youtube.com" || url.hostname.endsWith(".youtube.com")) ||
-      url.pathname !== "/watch" || !url.searchParams.get("v")) {
+  if (
+    !tab?.id ||
+    !url ||
+    url.protocol !== "https:" ||
+    !(url.hostname === "youtube.com" || url.hostname.endsWith(".youtube.com")) ||
+    url.pathname !== "/watch" ||
+    !url.searchParams.get("v")
+  ) {
     throw new Error("Open a YouTube video");
   }
   return { tabId: tab.id, videoId: url.searchParams.get("v") };
 }
 
 async function showVideoState(recoveringFromAd = false) {
-  const canUpdate = () => !popupClosed && (!generationStarted ||
-    (recoveringFromAd && document.body.dataset.state === "blocked" && status.textContent === "Wait for the ad to finish"));
+  const canUpdate = () =>
+    !popupClosed &&
+    (!generationStarted ||
+      (recoveringFromAd &&
+        document.body.dataset.state === "blocked" &&
+        status.textContent === "Wait for the ad to finish"));
   try {
     const video = await activeVideo();
     if (!canUpdate()) return;
@@ -149,9 +177,13 @@ async function showVideoState(recoveringFromAd = false) {
     send({ watch: video });
     const [injection, { offerDownload }, working] = await Promise.all([
       chrome.scripting.executeScript({
-        target: { tabId: video.tabId }, world: "MAIN", func: readChapterState, args: [video.videoId],
+        target: { tabId: video.tabId },
+        world: "MAIN",
+        func: readChapterState,
+        args: [video.videoId],
       }),
-      modelState, running,
+      modelState,
+      running,
     ]);
     const result = injection[0];
     if (canUpdate()) {
@@ -159,9 +191,14 @@ async function showVideoState(recoveringFromAd = false) {
       else if (result?.result?.blocked) showError(new Error(result.result.blocked));
       // The page still shows chapters from an earlier run, whose popup has closed.
       else if (result?.result?.added) showState("success", "Chapters added", downloadNote);
-      else if (result?.result?.transcript === false) showState("unavailable", "Video has no transcript");
+      else if (result?.result?.transcript === false)
+        showState("unavailable", "Video has no transcript");
       else {
-        showState("idle", "Generate chapters", result?.result?.native ? "Video already has chapters" : downloadNote);
+        showState(
+          "idle",
+          "Generate chapters",
+          result?.result?.native ? "Video already has chapters" : downloadNote,
+        );
         offer.hidden = !offerDownload || downloadStarted;
         warmModel();
       }
@@ -169,7 +206,9 @@ async function showVideoState(recoveringFromAd = false) {
   } catch (error) {
     if (canUpdate()) {
       console.error(error);
-      showError(error.message === "Open a YouTube video" ? error : new Error("Can't access this video"));
+      showError(
+        error.message === "Open a YouTube video" ? error : new Error("Can't access this video"),
+      );
     }
   }
 }
@@ -180,27 +219,48 @@ function readChapterState(expectedVideoId) {
   const response = player?.getPlayerResponse?.();
   const duration = Number(player?.getDuration?.());
   const current = response?.videoDetails?.videoId === expectedVideoId;
-  const blocked = player?.classList?.contains("ad-showing") ? "Wait for the ad to finish" :
-    current && duration > 0 && duration < 4 ? "Video too short" : "";
+  const blocked = player?.classList?.contains("ad-showing")
+    ? "Wait for the ad to finish"
+    : current && duration > 0 && duration < 4
+      ? "Video too short"
+      : "";
   // The transcript is read from the captions the player lists, so a video that lists none has no transcript. A player
   // still showing another video says nothing about this one.
-  const transcript = !current || Boolean(response.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length);
+  const transcript =
+    !current || Boolean(response.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length);
   // Read the current player's chapter data, not the shared "In this video" button.
   const next = player?.getWatchNextResponse?.();
-  const markers = next?.playerOverlays?.playerOverlayRenderer?.decoratedPlayerBarRenderer
-    ?.decoratedPlayerBarRenderer?.playerBar?.multiMarkersPlayerBarRenderer?.markersMap;
-  const native = current && next?.currentVideoEndpoint?.watchEndpoint?.videoId === expectedVideoId &&
-    Array.isArray(markers) && markers.some((marker) => {
+  const markers =
+    next?.playerOverlays?.playerOverlayRenderer?.decoratedPlayerBarRenderer
+      ?.decoratedPlayerBarRenderer?.playerBar?.multiMarkersPlayerBarRenderer?.markersMap;
+  const native =
+    current &&
+    next?.currentVideoEndpoint?.watchEndpoint?.videoId === expectedVideoId &&
+    Array.isArray(markers) &&
+    markers.some((marker) => {
       const chapters = marker?.value?.chapters;
-      return Array.isArray(chapters) && chapters.length > 1 && chapters.every((entry, index) => {
-        const chapter = entry?.chapterRenderer;
-        const title = chapter?.title;
-        const text = title?.simpleText ?? (Array.isArray(title?.runs)
-          ? title.runs.map(run => typeof run?.text === "string" ? run.text : "").join("") : "");
-        const start = chapter?.timeRangeStartMillis;
-        return typeof text === "string" && text.trim().length > 0 && Number.isSafeInteger(start) &&
-          (index === 0 ? start === 0 : start > chapters[index - 1].chapterRenderer.timeRangeStartMillis);
-      });
+      return (
+        Array.isArray(chapters) &&
+        chapters.length > 1 &&
+        chapters.every((entry, index) => {
+          const chapter = entry?.chapterRenderer;
+          const title = chapter?.title;
+          const text =
+            title?.simpleText ??
+            (Array.isArray(title?.runs)
+              ? title.runs.map((run) => (typeof run?.text === "string" ? run.text : "")).join("")
+              : "");
+          const start = chapter?.timeRangeStartMillis;
+          return (
+            typeof text === "string" &&
+            text.trim().length > 0 &&
+            Number.isSafeInteger(start) &&
+            (index === 0
+              ? start === 0
+              : start > chapters[index - 1].chapterRenderer.timeRangeStartMillis)
+          );
+        })
+      );
     });
   // Chapters this extension drew stay on the page until the tab leaves the video.
   return { blocked, native, transcript, added: Boolean(window.__nanoChaptersCleanup) };
