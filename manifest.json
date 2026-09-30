@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "YouTube Nano Chapters",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "minimum_chrome_version": "138",
-  "description": "Create YouTube chapters on your device, with Gemini Nano titles.",
+  "description": "Create YouTube chapters on your device from the transcript.",
   "permissions": ["activeTab", "scripting"],
   "background": {
     "service_worker": "background.js"
