@@ -46,8 +46,14 @@ function popup(options = {}) {
     options.tab === undefined
       ? { id: 42, url: "https://www.youtube.com/watch?v=original-video" }
       : options.tab;
+  // The popup's saved choices, kept across popups like the extension's own storage.
+  const stored = new Map(Object.entries(options.stored ?? {}));
   const globals = {
     URL,
+    localStorage: {
+      getItem: (key) => stored.get(key) ?? null,
+      setItem: (key, value) => stored.set(key, String(value)),
+    },
     AbortController,
     Date: Clock,
     setTimeout(callback, delay) {
@@ -275,7 +281,14 @@ function popup(options = {}) {
       },
     };
     const offer = { hidden: true };
-    const optIn = { checked: false };
+    let change;
+    const optIn = {
+      checked: false,
+      addEventListener(event, listener) {
+        assert.equal(event, "change");
+        change = listener;
+      },
+    };
     const elements = {
       "#create": button,
       "#label": label,
@@ -326,6 +339,11 @@ function popup(options = {}) {
       ready: vm.runInContext("initialState", context),
       readChapterState: vm.runInContext("readChapterState", context),
       click: () => click(),
+      // The user flips the Gemini Nano titles switch.
+      flip(on) {
+        optIn.checked = on;
+        change();
+      },
       // Closing the popup ends its page and, with it, its connections to the worker.
       close() {
         window.dispatchEvent(new Event("pagehide"));
@@ -1134,68 +1152,57 @@ for (const availability of ["downloadable", "downloading"]) {
   });
 }
 
-// A finished download reports "available" and the offer disappears on its own; a download that died leaves the
-// box for another try.
-for (const [name, options, offered] of [
-  ["a downloadable model", { availability: "downloadable" }, true],
-  ["a model already on the device", {}, false],
-  ["a model still downloading", { availability: "downloading" }, false],
-  ["an unavailable model", { availability: "unavailable" }, false],
-  ["a missing Prompt API", { missingApi: true }, false],
+// The switch shows wherever Chrome can run the model. Unless the user chose, it is on only where the model is already
+// on the device, so nothing downloads unasked.
+for (const [name, options, shown, on] of [
+  ["a downloadable model", { availability: "downloadable" }, true, false],
+  ["a model already on the device", {}, true, true],
+  ["a model still downloading", { availability: "downloading" }, true, false],
+  ["an unavailable model", { availability: "unavailable" }, false, false],
+  ["a missing Prompt API", { missingApi: true }, false, false],
+  ["a saved choice to switch off", { stored: { nanoTitles: "off" } }, true, false],
   [
-    "a blocked video",
-    { availability: "downloadable", chapterState: { blocked: "Video too short" } },
-    false,
+    "a saved choice to switch on",
+    { availability: "downloadable", stored: { nanoTitles: "on" } },
+    true,
+    true,
   ],
 ]) {
-  test(`${name} ${offered ? "offers" : "does not offer"} better titles`, async () => {
+  test(`${name} ${shown ? `shows the switch ${on ? "on" : "off"}` : "hides the switch"}`, async () => {
     const app = popup(options);
     await app.ready;
     await tick();
-    assert.equal(app.offer.hidden, !offered);
-    assert.equal(app.optIn.checked, false);
+    assert.equal(app.offer.hidden, !shown);
+    assert.equal(app.optIn.checked, on);
+    assert.equal(
+      app.sessions.length,
+      0 + (on && !options.availability ? 1 : 0),
+      "only a model on the device warms",
+    );
   });
 }
 
-test("ticking the offer and clicking hides the offer and starts the download", async () => {
+test("switching on a downloadable model starts the download and these chapters are still named in code", async () => {
   const app = popup({ availability: "downloadable" });
   await app.ready;
-  assert.equal(app.offer.hidden, false);
-  app.optIn.checked = true;
-  await app.click();
-  assert.equal(app.offer.hidden, true, "the offer is answered for this popup");
-  assert.equal(app.sessions.length, 1, "the click starts the download");
-  // Nothing cancels the download: it must survive the popup that asked for it.
-  assert.equal(app.createCalls.length, 1);
-  assert.equal(app.createCalls[0].signal, undefined);
+  app.flip(true);
+  // Chrome allows the download only from the user's own click on the switch.
+  assert.equal(app.sessions.length, 1, "the switch starts the download");
   assert.equal(typeof app.createCalls[0].monitor, "function");
-  // The download outlives this run, so these chapters are still named in code.
+  assert.equal(app.status.textContent, "Downloading model");
+  await app.click();
   assert.equal(app.prompted(), 0);
   assertKeywordChapters(app);
-  assertSuccess(app, { modelOnDevice: false });
+  assertSuccess(app, { modelOnDevice: false, message: "Downloading model" });
   await tick();
   assert.equal(app.destroyed(), 1, "the download session is released once Chrome has the model");
 });
 
-test("an unticked offer downloads nothing and stays on screen", async () => {
+test("a switch left off downloads nothing", async () => {
   const app = popup({ availability: "downloadable" });
   await app.ready;
   await app.click();
-  assert.equal(app.offer.hidden, false);
-  assert.equal(app.sessions.length, 0);
-  assertSuccess(app, { modelOnDevice: false });
-});
-
-test("the download starts on the click itself, ahead of every await", async () => {
-  const app = popup({ availability: "downloadable" });
-  await app.ready;
-  app.optIn.checked = true;
-  const run = app.click();
-  // Chrome allows the download only from the click, so it cannot wait for the model read or the transcript.
-  assert.equal(app.sessions.length, 1);
-  assert.equal(app.offer.hidden, true);
-  assert.equal(app.calls.length, 0, "the run itself has not started yet");
-  await run;
+  assert.equal(app.createCalls.length, 0);
   assertSuccess(app, { modelOnDevice: false });
 });
 
@@ -1203,7 +1210,7 @@ test("download progress reaches the status line until the popup closes", async (
   const download = deferred();
   const app = popup({ availability: "downloadable", modelReady: download.promise });
   await app.ready;
-  app.optIn.checked = true;
+  app.flip(true);
   const run = app.click();
   app.reportProgress(0.34);
   // A run in progress keeps the screen; the note waits for the state that has room for it.
@@ -1215,52 +1222,65 @@ test("download progress reaches the status line until the popup closes", async (
   app.close();
   app.reportProgress(1);
   assert.equal(app.status.textContent, "Downloading model 90%", "a closed popup is not written to");
+  // Nothing cancels the download: it must survive the popup that asked for it.
+  assert.equal(app.createCalls[0].signal, undefined);
   download.resolve();
   await tick();
   assert.equal(app.destroyed(), 1);
 });
 
+test("switching off during the download hides the progress and is remembered", async () => {
+  const download = deferred();
+  const app = popup({ availability: "downloadable", modelReady: download.promise, stored: {} });
+  await app.ready;
+  app.flip(true);
+  app.reportProgress(0.3);
+  assert.equal(app.status.textContent, "Downloading model 30%");
+  app.flip(false);
+  assert.equal(app.status.textContent, "");
+  app.reportProgress(0.4);
+  assert.equal(app.status.textContent, "", "late progress is ignored");
+  const reopened = app.reopen();
+  await reopened.ready;
+  assert.equal(reopened.optIn.checked, false, "the choice is remembered");
+});
+
 test("download progress never overwrites a failure the user must read", async () => {
   const app = popup({ availability: "downloadable", rendererError: new Error("Video changed") });
   await app.ready;
-  app.optIn.checked = true;
+  app.flip(true);
   await app.click();
   assertRetry(app, /Video changed/);
   app.reportProgress(0.5);
   assert.equal(app.status.textContent, "Video changed", "the error stays on screen");
 });
 
-test("an ad after a ticked click keeps the offer hidden and starts no second download", async () => {
-  const options = {
-    availability: "downloadable",
-    transcriptResultError: "Wait for the ad to finish",
-  };
-  const app = popup(options);
+test("switching Nano off with the model on the device names the chapters in code and releases the early model", async () => {
+  const app = popup();
   await app.ready;
-  app.optIn.checked = true;
+  await tick();
+  assert.equal(app.sessions.length, 1);
+  app.flip(false);
   await app.click();
-  assert.equal(app.body.dataset.state, "blocked");
-  assert.equal(app.sessions.length, 1, "one download");
-  assert.equal(app.offer.hidden, true);
-  // The ad recheck repaints the idle state; the ticked box must not come back with it.
-  await app.checkAd();
-  assert.equal(app.body.dataset.state, "idle");
-  assert.equal(app.offer.hidden, true, "a started download is never offered again");
-  delete options.transcriptResultError;
-  await app.click();
-  assert.equal(app.sessions.length, 1, "no second 4 GB download");
+  await tick();
+  assert.equal(app.prompted(), 0);
+  assertKeywordChapters(app);
+  // Without Nano a second run would give the same titles, so the button rests.
   assertSuccess(app, { modelOnDevice: false });
+  assert.equal(app.destroyed(), 1);
+  app.flip(true);
+  assertSuccess(app, { modelOnDevice: true });
 });
 
 test("a download Chrome refuses fails silently and the chapters are still named", async () => {
   const app = popup({ availability: "downloadable", createError: new Error("Not enough space") });
   await app.ready;
-  app.optIn.checked = true;
+  app.flip(true);
   await app.click();
   assert.equal(app.sessions.length, 0, "no session survived the failed create");
   assert.equal(app.createCalls.length, 1);
   assertKeywordChapters(app);
-  assertSuccess(app, { modelOnDevice: false });
+  assertSuccess(app, { modelOnDevice: false, message: "Downloading model" });
   // A rejected create must not surface as an unhandled rejection or an error on screen.
   await tick();
   assert.equal(app.errors.length, 0);
@@ -1380,7 +1400,7 @@ for (const [name, options] of [
   test(`${name} names the chapters in code and never mentions Gemini Nano`, async () => {
     const app = popup(options);
     await app.ready;
-    assert.equal(app.offer.hidden, true, "nothing to download, so nothing to offer");
+    assert.equal(app.offer.hidden, true, "nothing to switch on");
     await app.click();
     assertKeywordChapters(app);
     assertSuccess(app, { modelOnDevice: false });

@@ -53,9 +53,9 @@ async function preloadModel(signal) {
   return LanguageModel.create({ ...MODEL_OPTIONS, signal });
 }
 
-// Starts the one-time model download. Chrome only allows it from a click, and it deliberately takes no signal: closing
-// the popup ends the progress reports, not the download. A failure is silent, because chapters are named in code
-// either way.
+// Starts the one-time model download. Chrome only allows it from a click. It takes no signal: Chrome finishes a
+// download it has started even when the request is aborted (tested in Chrome 154), and closing the popup ends only the
+// progress reports. A failure is silent, because chapters are named in code either way.
 function startModelDownload(onProgress = () => {}) {
   if (typeof LanguageModel === "undefined") return;
   LanguageModel.create({
@@ -116,7 +116,7 @@ async function generateChapterData({
       }
       controller.signal.throwIfAborted();
       // Only a model already on the device names chapters. One still to download is never fetched here, so only the
-      // popup's download offer starts one.
+      // popup's switch starts one.
       if (availability !== "available") {
         if (!fallbackTitles) throw new Error("Gemini Nano unavailable");
         useModel = false;

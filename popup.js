@@ -10,8 +10,6 @@ let popupClosed = false;
 // With the model already on the device, it loads early and the popup offers to name the chapters again.
 let modelReady = false;
 let downloadNote = "";
-// One download per popup: an ad or a failed run must not offer the box again and start a second one.
-let downloadStarted = false;
 window.addEventListener(
   "pagehide",
   () => {
@@ -53,30 +51,37 @@ const reply = (key) =>
     replies[key] = resolve;
   });
 
-// One read of the model per popup. The offer appears only where ticking it does something: Chrome has the model
-// ready to fetch. A finished download makes it "available" and the box never returns; a download that died leaves
-// the box for another try.
+// One read of the model per popup. The switch appears wherever Chrome can run the model; a device that can't is
+// never told so. It keeps the user's choice, and without one starts on only where the model is already on the device,
+// so nothing downloads unasked.
+let availability = "unavailable";
 const modelState = (async () => {
-  const availability = await modelAvailability();
+  availability = await modelAvailability();
   modelReady = availability === "available";
-  // A download Chrome is already running reports no progress here, so the popup says nothing about it.
-  return { offerDownload: availability === "downloadable" };
+  const saved = localStorage.getItem("nanoTitles");
+  optIn.checked = saved ? saved === "on" : modelReady;
+  offer.hidden = availability === "unavailable";
+  // A download Chrome is already running reports no progress to a popup that didn't start it.
+  if (optIn.checked && availability === "downloading") downloadNote = "Downloading model";
 })();
 
-// When the popup shows a video that can generate and the model is already on the device, the worker starts loading
-// the model at once, so the click pays no startup. The worker keeps at most one such model per popup.
+// Nano names the chapters only where the model is on the device and the switch is on.
+const nanoOn = () => modelReady && optIn.checked;
+
+// When the popup shows a video that can generate and Nano will name its chapters, the worker starts loading the
+// model at once, so the click pays no startup. The worker keeps at most one such model per popup.
 function warmModel() {
-  if (modelReady) send({ warmUp: true });
+  if (nanoOn()) send({ warmUp: true });
 }
 
 function showState(state, text, message = "") {
   clearTimeout(adTimer);
   document.body.dataset.state = state;
   button.disabled =
-    ["working", "unavailable", "blocked"].includes(state) || (state === "success" && !modelReady);
+    ["working", "unavailable", "blocked"].includes(state) || (state === "success" && !nanoOn());
   label.textContent = text;
   // An SVG element has no hidden property, so the attribute is toggled directly.
-  const hideAgain = again.toggleAttribute("hidden", !(state === "success" && modelReady));
+  const hideAgain = again.toggleAttribute("hidden", !(state === "success" && nanoOn()));
   // The arrow carries no text, so the button says what a second click would do.
   if (hideAgain) button.removeAttribute("aria-label");
   else button.setAttribute("aria-label", "Generate chapters again");
@@ -84,23 +89,37 @@ function showState(state, text, message = "") {
 }
 
 function showDownload(loaded) {
+  if (!optIn.checked) return;
   downloadNote = `Downloading model ${Math.round(loaded * 100)}%`;
   if (!popupClosed && ["idle", "success"].includes(document.body.dataset.state))
     status.textContent = downloadNote;
 }
 
+// Switching on starts the download where the model isn't on the device yet; Chrome allows that only from the click
+// itself. Switching off can't stop a started download, so it only stops using Nano and hides the progress.
+optIn.addEventListener("change", () => {
+  const previousNote = downloadNote;
+  localStorage.setItem("nanoTitles", optIn.checked ? "on" : "off");
+  if (optIn.checked && ["downloadable", "downloading"].includes(availability)) {
+    downloadNote = "Downloading model";
+    startModelDownload(showDownload);
+  } else if (!optIn.checked) downloadNote = "";
+  // Idle and success repaint for the new choice; a notice such as "Video already has chapters" stays.
+  const state = document.body.dataset.state;
+  if (state === "idle" || state === "success") {
+    const note = status.textContent;
+    showState(state, label.textContent, note === previousNote ? downloadNote : note);
+    if (state === "idle") warmModel();
+  }
+});
+
 button.addEventListener("click", () => {
   if (button.disabled) return;
-  // Chrome starts the download only from a click, so this stays ahead of every await in the handler.
-  if (!offer.hidden && optIn.checked) {
-    offer.hidden = true;
-    downloadStarted = true;
-    startModelDownload(showDownload);
-  }
+  // A click in the popup's first moment waits for the model read, which sets the switch.
   return follow(
-    activeVideo().then((video) => {
+    Promise.all([activeVideo(), modelState]).then(([video]) => {
       const ended = reply("ended");
-      send({ generate: video });
+      send({ generate: video, useModel: optIn.checked });
       return ended;
     }),
   );
@@ -175,7 +194,7 @@ async function showVideoState(recoveringFromAd = false) {
     const running = reply("running");
     const ended = reply("ended");
     send({ watch: video });
-    const [injection, { offerDownload }, working] = await Promise.all([
+    const [injection, , working] = await Promise.all([
       chrome.scripting.executeScript({
         target: { tabId: video.tabId },
         world: "MAIN",
@@ -199,7 +218,6 @@ async function showVideoState(recoveringFromAd = false) {
           "Generate chapters",
           result?.result?.native ? "Video already has chapters" : downloadNote,
         );
-        offer.hidden = !offerDownload || downloadStarted;
         warmModel();
       }
     }
