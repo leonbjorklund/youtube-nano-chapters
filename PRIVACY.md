@@ -12,7 +12,7 @@ All of this stays on your device. The generated chapter titles and start times a
 
 No backend, analytics, telemetry, accounts, API keys, or cloud AI. Nothing is sent to the developer or any external AI service, and nothing is sold or shared.
 
-Chrome downloads its AI model only when you tick "Better titles with Chrome AI". The transcript comes from YouTube, through the same request YouTube's transcript panel makes or through that panel itself. YouTube still makes its normal video requests, and the chapter panel loads preview images from YouTube. Chrome and YouTube handle those under their own privacy policies.
+Chrome downloads its AI model only when you turn on "Gemini Nano titles". The transcript comes from YouTube, through the same request YouTube's transcript panel makes or through that panel itself. YouTube still makes its normal video requests, and the chapter panel loads preview images from YouTube. Chrome and YouTube handle those under their own privacy policies.
 
 ## Permissions
 
