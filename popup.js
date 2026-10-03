@@ -125,7 +125,6 @@ button.addEventListener("click", () => {
   );
 });
 
-// Shows a run working until it ends, then how it ended.
 async function follow(run) {
   generationStarted = true;
   showState("working", "Generating chapters");
