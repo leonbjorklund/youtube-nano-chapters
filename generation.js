@@ -414,9 +414,10 @@ function splitCaption(cue, end) {
 // caption of only sounds such as "[Music]" is a break in speech, not a candidate. Dynamic programming then picks all
 // starts together (see below): each at least half an average chapter from the other starts and the video's end, at
 // least a minute or half an average chapter, whichever is less, from its start, where creators often end an intro,
-// and no chapter longer than 180 s where sixteen chapters allow it. A video gets as many chapters as creators make on average at its
-// length, 3.86 x minutes^0.355 (a Poisson fit to creator counts on the practice videos), from four to sixteen, more
-// where a chapter would otherwise run past 180 s, or fewer when those lengths leave too few candidates.
+// and no chapter longer than 180 s where twenty chapters allow it. A video gets as many chapters as creators make on
+// average at its length, 3.86 x minutes^0.355 (a Poisson fit to creator counts on the practice videos), from four to
+// sixteen, then more, up to twenty, until the average chapter is at most 150 s and none runs past 180 s, or fewer when
+// those lengths leave too few candidates.
 function selectStarts({ cues, duration }) {
   const count = Math.min(16, Math.max(4, Math.round(3.86 * (duration / 60) ** 0.355)));
   const gap = duration / count / 2;
@@ -630,21 +631,26 @@ function selectStarts({ cues, duration }) {
     index < size ? 4 * (scoreAt.get(times[index]) ?? 0) : 0,
   );
   const longest = (3 * duration) / count;
-  // Fill, for a viewer who watches on from a start: no chapter longer than 180 s, with the fewest chapters from the
-  // count up to 16 that allow it. A video too long for 16 such chapters gets 16, none longer than one and a half
-  // average chapters. Sparse captions can leave no way to keep every chapter under these lengths; the limit then
-  // loosens to three average chapters of the count, and then goes.
+  // Fill, for a viewer who watches on from a start: no chapter longer than 180 s. With only the fewest chapters that
+  // allow it, a video nearly too long for them gets chapters of nearly 180 s each at even steps, wherever the topics
+  // change. So chapters are added from the count until the average is at most 150 s, which leaves room to move each
+  // start, and the shortest chapter is half that average; more, up to 20, only where 180 s still will not fit. A video
+  // too long for 20 chapters of 150 s gets 20, none longer than one and a half average chapters. Sparse captions can
+  // leave no way to keep every chapter under these lengths; the limit then loosens to three average chapters of the
+  // count, and then goes.
+  const filled = Math.max(count, Math.ceil(duration / 150));
+  const shortest = duration / Math.min(20, filled) / 2;
   const steps =
-    duration <= 16 * 180
+    filled <= 20
       ? [
-          [Math.min(longest, 180), count, true],
+          [Math.min(longest, 180), filled, true],
           [longest, count],
           [Infinity, count],
         ]
       : [
-          [(1.5 * duration) / 16, 16],
-          [longest, 16],
-          [Infinity, 16],
+          [(1.5 * duration) / 20, 20],
+          [longest, 20],
+          [Infinity, 20],
         ];
   for (const [limit, want, grow] of steps) {
     const starts = segment(limit, want, grow);
@@ -652,9 +658,9 @@ function selectStarts({ cues, duration }) {
   }
   return [0];
 
-  // Picks want chapters or, with grow, the fewest from want up to 16 that fit; without grow, fewer when want will not fit.
+  // Picks want chapters or, with grow, the fewest from want up to 20 that fit; without grow, fewer when want will not fit.
   function segment(limit, want, grow) {
-    const most = grow ? 16 : want;
+    const most = grow ? 20 : want;
     // best[k][j]: the lowest cost of k chapters covering the units before j, with unit j starting the next chapter.
     const best = Array.from({ length: most + 1 }, () => new Float64Array(size + 1).fill(Infinity));
     const from = Array.from({ length: most + 1 }, () => new Int32Array(size + 1).fill(-1));
@@ -675,7 +681,10 @@ function selectStarts({ cues, duration }) {
         const end = j + 1;
         const length = at(end) - at(i);
         if (length > limit && end < size) break;
-        if (end < size && (at(end) > duration - gap || length < (i ? gap : Math.min(gap, 60))))
+        if (
+          end < size &&
+          (at(end) > duration - shortest || length < (i ? shortest : Math.min(shortest, 60)))
+        )
           continue;
         const cost = spans[said] - spread - bonus[end];
         for (let k = low; k <= high; k++) {
@@ -1182,6 +1191,7 @@ function nameChapters(sections, title) {
       bigram,
       pairForm,
       noun,
+      tokens,
       headWords,
       firstWords,
       words: tokens.length,
@@ -1507,7 +1517,6 @@ function nameChapters(sections, title) {
       used.add("intro");
       if (overview) {
         take(overview);
-        fixed.add(index);
         return overview;
       }
       if (!long) return "Intro";
@@ -1532,6 +1541,67 @@ function nameChapters(sections, title) {
   // at least twice, shares no word with the title's other phrases, is not another chapter's
   // phrase or one-word title, and keeps the title within 60 characters. A bare numbered label ("Step 1") takes the
   // phrases after a colon. Intro, Outro, overviews and questions stay as they are.
+  // Words the video says right after a subject pronoun ("it rises") are verbs, never the end of a name.
+  const verbs = new Set();
+  stats.forEach(({ tokens }) =>
+    tokens.forEach((word, i) => {
+      if (i && /^(?:i|you|he|she|it|we|they|who)$/i.test(tokens[i - 1])) verbs.add(stem(word));
+    }),
+  );
+  // A two- or three-word phrase that the section nearly always says inside a longer one ("Obstructive Sleep" in
+  // "obstructive sleep apnea", "World War" in "World War II") is a cut-off name, so it takes the word the section says
+  // next to it in at least 70% of its mentions, two or more, up to four words, while the title stays within 50
+  // characters. The added word must be a content word the title doesn't already hold, or a number after the phrase,
+  // and not a word the video says right after a subject ("it supports", the verbs set above), which marks a verb.
+  const whole = (parts, stat, joined) => {
+    const stems = stat.tokens.map(stem);
+    const grown = [...parts];
+    grown.forEach((part, at) => {
+      let words = part.split(" ");
+      while (words.length >= 2 && words.length < 4 && words.every((w) => /^[A-Z0-9]/.test(w))) {
+        const want = words.map(stem);
+        const seen = [];
+        for (let i = 0; i + want.length <= stems.length; i++)
+          if (want.every((k, j) => stems[i + j] === k)) seen.push(i);
+        if (seen.length < 2) break;
+        const side = (offset) => {
+          const near = new Map();
+          const forms = new Map();
+          for (const i of seen) {
+            const word = stat.tokens[offset < 0 ? i - 1 : i + want.length];
+            if (!word) continue;
+            inc(near, stem(word));
+            inc(forms.get(stem(word)) || forms.set(stem(word), new Map()).get(stem(word)), word.toLowerCase());
+          }
+          const [k, n] = [...near].sort((a, b) => b[1] - a[1])[0] || [];
+          return n >= 2 && n >= 0.7 * seen.length
+            ? [...forms.get(k)].sort((a, b) => b[1] - a[1])[0][0]
+            : null;
+        };
+        const before = side(-1);
+        const after = side(1);
+        const held = new Set(grown.flatMap((p) => p.split(" ").map(stem)));
+        const ok = (w, last) =>
+          w &&
+          (/^(?:\d+|ii|iii|iv)$/.test(w)
+            ? last
+            : keep(w) && !verbs.has(stem(w)) && !AN_PREP.test(w) && !/^(?:against|dot|dash|slash)$/.test(w)) &&
+          !held.has(stem(w));
+        const next = ok(before, false)
+          ? [cap(before), ...words]
+          : ok(after, true)
+            ? [...words, /^(?:ii|iii|iv)$/.test(after) ? after.toUpperCase() : cap(after)]
+            : null;
+        if (!next) break;
+        const trial = [...grown];
+        trial[at] = next.join(" ");
+        if (joined(trial).length > 50) break;
+        words = next;
+        grown[at] = trial[at];
+      }
+    });
+    return grown;
+  };
   const list = (parts) =>
     parts.length < 3
       ? parts.join(" & ")
@@ -1545,7 +1615,11 @@ function nameChapters(sections, title) {
       /\?$/.test(text)
     )
       return text;
-    const label = /^[A-Z][a-z]+ \d+$/.test(text);
+    // "<subject> Overview" names only the video's subject, so the first section's own phrases follow it after a colon,
+    // as a numbered label's do: a viewer looking for something said there sees it. It takes at most two, so the title
+    // holds three phrases and stays within 50 characters.
+    const overview = !index && / Overview$/.test(text);
+    const label = /^[A-Z][a-z]+ \d+$/.test(text) || overview;
     const parts = label ? [] : [text];
     const stems = new Set(parts.flatMap(content));
     const first =
@@ -1553,7 +1627,7 @@ function nameChapters(sections, title) {
     const base = first ? first.score * 0.25 : 0;
     const value = (o) => o.score * (o.stems.length > 1 ? 1.5 : 1);
     const joined = (more) => (label ? `${text}: ${list(more)}` : list(more));
-    while (parts.length < 3) {
+    while (parts.length < (overview ? 2 : 3)) {
       const clash = (k) =>
         usedSingles.has(k) || [...stems].some((s) => k.startsWith(s) || s.startsWith(k));
       const options = ranked[index].filter(
@@ -1565,21 +1639,46 @@ function nameChapters(sections, title) {
           grounded(o.text, stats[index]) &&
           !o.stems.some(clash),
       );
-      const next = options
-        .filter((o) => o.score >= base)
-        .sort((a, b) => value(b) - value(a))
-        .map((o) => wider(options, o).text)
-        .find(
-          (extra) =>
-            extra.length >= 3 &&
-            !content(extra).some(clash) &&
-            joined([...parts, extra]).length <= 60,
+      const pick = (pool, floor, limit) =>
+        pool
+          .filter((o) => o.score >= floor)
+          .sort((a, b) => value(b) - value(a))
+          .map((o) => wider(pool, o).text)
+          .find(
+            (extra) =>
+              extra.length >= 3 &&
+              !content(extra).some(clash) &&
+              joined([...parts, extra]).length <= limit,
+          );
+      let next = pick(options, base, overview ? 50 : 60);
+      // A title that would name a single phrase tells a viewer little about the rest of its section, and most such
+      // sections are short, where little is said twice. Such a title also takes a second phrase scoring at least a
+      // tenth of the first, not a quarter, and said once if it is among the section's five strongest phrases and ends
+      // in a word the section uses as a noun ("the ratio") or a name. A phrase ending in a word the video says right
+      // after a subject ("it rises") is a clause, not a name. The title stays within 50 characters.
+      if (!next && parts.length < (label ? 1 : 2)) {
+        const stat = stats[index];
+        next = pick(
+          ranked[index].filter(
+            (o, rank) =>
+              o.noun &&
+              !o.weak &&
+              (o.count >= 2 ||
+                (rank < 5 && (o.proper || nounish(stat, o.stems[o.stems.length - 1])))) &&
+              !verbs.has(o.stems[o.stems.length - 1]) &&
+              !used.has(key(o.text)) &&
+              grounded(o.text, stat) &&
+              !o.stems.some(clash),
+          ),
+          base * 0.4,
+          50,
         );
+      }
       if (!next) break;
       take(next);
       parts.push(next);
       content(next).forEach((k) => stems.add(k));
     }
-    return parts.length ? joined(parts) : text;
+    return parts.length ? joined(whole(parts, stats[index], joined)) : text;
   });
 }

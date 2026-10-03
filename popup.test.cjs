@@ -1550,10 +1550,10 @@ test("titles are asked eight chapters at a time, each batch in its own copy of t
   await app.click();
   assertSuccess(app);
   const starts = [...app.selectStarts(transcriptResult)];
-  assert.equal(starts.length, 14);
+  assert.equal(starts.length, 16);
   assert.deepEqual(
     app.prompts.map((prompt) => prompt.options.responseConstraint.required.length),
-    [8, 6],
+    [8, 8],
   );
   assert.match(
     app.prompts[0].text,
@@ -1578,7 +1578,7 @@ test("titles are asked eight chapters at a time, each batch in its own copy of t
     );
   assert.deepEqual(
     chapters.map((chapter) => chapter.title.split(": ")[0]),
-    [...batch(8), ...batch(6)],
+    [...batch(8), ...batch(8)],
   );
 });
 
@@ -1663,14 +1663,16 @@ test("chapter count follows duration and starts stay half an average chapter apa
       text: `Next, topic ${index}.`,
     })),
   });
-  // 3.86 x minutes^0.355 rounds from 8 to 9 at 555 s. At 2880 s it gives 15, but 16 chapters keep each within 180 s.
+  // 3.86 x minutes^0.355 rounds from 8 to 9 at 555 s. At 2400 s it gives 14, but chapters are added until the average
+  // is at most 150 s: 16. From 2880 s that takes 20, the most.
   for (const [duration, count] of [
     [60, 4],
     [554, 8],
     [555, 9],
-    [2880, 16],
-    [3000, 16],
-    [7200, 16],
+    [2400, 16],
+    [2880, 20],
+    [3600, 20],
+    [7200, 20],
   ]) {
     const starts = app.selectStarts(transcript(duration));
     assert.equal(starts.length, count, `${duration}`);
@@ -1683,7 +1685,7 @@ test("chapter count follows duration and starts stay half an average chapter apa
       );
     });
     // Creators often end an intro at about a minute, so the first start may sit there on long videos.
-    if (duration === 3000) assert.equal(starts[1], 60);
+    if (duration === 3600) assert.equal(starts[1], 60);
   }
 });
 
@@ -2459,7 +2461,7 @@ test("a repeated collocation beats its single words without an announcement", ()
     ),
     "Dishwasher Tips",
   );
-  assert.deepEqual(titles, ["Heating Element", "Rinse Aid"]);
+  assert.deepEqual(titles, ["Heating Element & Water", "Rinse Aid"]);
 });
 
 test("a section that repeats three strong phrases names all three, and one with a single phrase keeps it alone", () => {
